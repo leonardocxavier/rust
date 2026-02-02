@@ -103,17 +103,18 @@ pub fn link_binary(
         });
 
         if outputs.outputs.should_link() {
-            let tmpdir = TempDirBuilder::new()
-                .prefix("rustc")
-                .tempdir()
-                .unwrap_or_else(|error| sess.dcx().emit_fatal(errors::CreateTempDir { error }));
-            let path = MaybeTempDir::new(tmpdir, sess.opts.cg.save_temps);
             let output = out_filename(
                 sess,
                 crate_type,
                 outputs,
                 codegen_results.crate_info.local_crate_name,
             );
+            let tmpdir = TempDirBuilder::new()
+                .prefix("rustc")
+                .tempdir_in(output.parent().unwrap_or_else(|| Path::new(".")))
+                .unwrap_or_else(|error| sess.dcx().emit_fatal(errors::CreateTempDir { error }));
+            let path = MaybeTempDir::new(tmpdir, sess.opts.cg.save_temps);
+
             let crate_name = format!("{}", codegen_results.crate_info.local_crate_name);
             let out_filename = output.file_for_writing(
                 outputs,
@@ -135,7 +136,7 @@ pub fn link_binary(
                     )
                     .build(&out_filename);
                 }
-                CrateType::Staticlib => {
+                CrateType::StaticLib => {
                     link_staticlib(
                         sess,
                         archive_builder_builder,
@@ -473,7 +474,7 @@ fn link_staticlib(
 
     let res = each_linked_rlib(
         &codegen_results.crate_info,
-        Some(CrateType::Staticlib),
+        Some(CrateType::StaticLib),
         &mut |cnum, path| {
             let lto = are_upstream_rust_objects_already_included(sess)
                 && !ignored_for_lto(sess, &codegen_results.crate_info, cnum);
@@ -531,7 +532,7 @@ fn link_staticlib(
     let fmts = codegen_results
         .crate_info
         .dependency_formats
-        .get(&CrateType::Staticlib)
+        .get(&CrateType::StaticLib)
         .expect("no dependency formats for staticlib");
 
     let mut all_rust_dylibs = vec![];
@@ -1209,7 +1210,7 @@ fn add_sanitizer_libraries(
         return;
     }
 
-    if matches!(crate_type, CrateType::Rlib | CrateType::Staticlib) {
+    if matches!(crate_type, CrateType::Rlib | CrateType::StaticLib) {
         return;
     }
 

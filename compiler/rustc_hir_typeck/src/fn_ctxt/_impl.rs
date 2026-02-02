@@ -14,13 +14,15 @@ use rustc_hir_analysis::hir_ty_lowering::generics::{
     check_generic_arg_count_for_call, lower_generic_args,
 };
 use rustc_hir_analysis::hir_ty_lowering::{
-    ExplicitLateBound, FeedConstTy, GenericArgCountMismatch, GenericArgCountResult,
-    GenericArgsLowerer, GenericPathSegment, HirTyLowerer, IsMethodCall, RegionInferReason,
+    ExplicitLateBound, GenericArgCountMismatch, GenericArgCountResult, GenericArgsLowerer,
+    GenericPathSegment, HirTyLowerer, IsMethodCall, RegionInferReason,
 };
 use rustc_infer::infer::canonical::{Canonical, OriginalQueryValues, QueryResponse};
 use rustc_infer::infer::{DefineOpaqueTypes, InferResult};
 use rustc_lint::builtin::SELF_CONSTRUCTOR_FROM_OUTER_ITEM;
-use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow, AutoBorrowMutability};
+use rustc_middle::ty::adjustment::{
+    Adjust, Adjustment, AutoBorrow, AutoBorrowMutability, DerefAdjustKind,
+};
 use rustc_middle::ty::{
     self, AdtKind, CanonicalUserType, GenericArgsRef, GenericParamDefKind, IsIdentity,
     SizedTraitKind, Ty, TyCtxt, TypeFoldable, TypeVisitable, TypeVisitableExt, UserArgs,
@@ -216,7 +218,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Don't write user type annotations for const param types, since we give them
         // identity args just so that we can trivially substitute their `EarlyBinder`.
         // We enforce that they match their type in MIR later on.
-        if matches!(self.tcx.def_kind(def_id), DefKind::ConstParam) {
+        if self.tcx.def_kind(def_id) == DefKind::ConstParam {
             return;
         }
 
@@ -266,7 +268,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         debug!("apply_adjustments: adding `{:?}` as diverging type var", a.target);
                     }
                 }
-                Adjust::Deref(Some(overloaded_deref)) => {
+                Adjust::Deref(DerefAdjustKind::Overloaded(overloaded_deref)) => {
                     self.enforce_context_effects(
                         None,
                         expr.span,
@@ -274,7 +276,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         self.tcx.mk_args(&[expr_ty.into()]),
                     );
                 }
-                Adjust::Deref(None) => {
+                Adjust::Deref(DerefAdjustKind::Builtin) => {
                     // FIXME(const_trait_impl): We *could* enforce `&T: [const] Deref` here.
                 }
                 Adjust::Pointer(_pointer_coercion) => {
@@ -525,9 +527,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(crate) fn lower_const_arg(
         &self,
         const_arg: &'tcx hir::ConstArg<'tcx>,
-        feed: FeedConstTy<'_, 'tcx>,
+        ty: Ty<'tcx>,
     ) -> ty::Const<'tcx> {
-        let ct = self.lowerer().lower_const_arg(const_arg, feed);
+        let ct = self.lowerer().lower_const_arg(const_arg, ty);
         self.register_wf_obligation(
             ct.into(),
             self.tcx.hir_span(const_arg.hir_id),
@@ -1004,6 +1006,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             err_extend,
         );
 
+        if let Err(e) = self.lowerer().check_param_res_if_mcg_for_instantiate_value_path(res, span)
+        {
+            return (Ty::new_error(self.tcx, e), res);
+        }
+
         if let Res::Local(hid) = res {
             let ty = self.local_ty(span, hid);
             let ty = self.normalize(span, ty);
@@ -1223,7 +1230,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // Ambiguous parts of `ConstArg` are handled in the match arms below
                         .lower_const_arg(
                             ct.as_unambig_ct(),
-                            FeedConstTy::Param(param.def_id, preceding_args),
+                            self.fcx
+                                .tcx
+                                .type_of(param.def_id)
+                                .instantiate(self.fcx.tcx, preceding_args),
                         )
                         .into(),
                     (&GenericParamDefKind::Const { .. }, GenericArg::Infer(inf)) => {

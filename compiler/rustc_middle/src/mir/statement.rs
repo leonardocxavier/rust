@@ -25,7 +25,7 @@ impl<'tcx> Statement<'tcx> {
     /// Changes a statement to a nop. This is both faster than deleting instructions and avoids
     /// invalidating statement indices in `Location`s.
     pub fn make_nop(&mut self, drop_debuginfo: bool) {
-        if matches!(self.kind, StatementKind::Nop) {
+        if self.kind == StatementKind::Nop {
             return;
         }
         let replaced_stmt = std::mem::replace(&mut self.kind, StatementKind::Nop);
@@ -372,6 +372,12 @@ impl<'tcx> Place<'tcx> {
     /// same region of memory as its base.
     pub fn is_indirect(&self) -> bool {
         self.projection.iter().any(|elem| elem.is_indirect())
+    }
+
+    /// Returns `true` if the `Place` always refers to the same memory region
+    /// whatever the state of the program.
+    pub fn is_stable_offset(&self) -> bool {
+        self.projection.iter().all(|elem| elem.is_stable_offset())
     }
 
     /// Returns `true` if this `Place`'s first projection is `Deref`.
@@ -836,7 +842,7 @@ impl BorrowKind {
 
     /// Returns whether borrows represented by this kind are allowed to be split into separate
     /// Reservation and Activation phases.
-    pub fn allows_two_phase_borrow(&self) -> bool {
+    pub fn is_two_phase_borrow(&self) -> bool {
         match *self {
             BorrowKind::Shared
             | BorrowKind::Fake(_)
