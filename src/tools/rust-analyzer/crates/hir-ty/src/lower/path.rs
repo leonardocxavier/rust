@@ -32,7 +32,8 @@ use crate::{
     db::HirDatabase,
     generics::{Generics, generics},
     lower::{
-        LifetimeElisionKind, PathDiagnosticCallbackData, named_associated_type_shorthand_candidates,
+        GenericPredicateSource, LifetimeElisionKind, PathDiagnosticCallbackData,
+        named_associated_type_shorthand_candidates,
     },
     next_solver::{
         Binder, Clause, Const, DbInterner, ErrorGuaranteed, GenericArg, GenericArgs, Predicate,
@@ -395,12 +396,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         }
 
         let (mod_segments, enum_segment, resolved_segment_idx) = match res {
-            ResolveValueResult::Partial(_, unresolved_segment, _) => {
+            ResolveValueResult::Partial(_, unresolved_segment) => {
                 (segments.take(unresolved_segment - 1), None, unresolved_segment - 1)
             }
-            ResolveValueResult::ValueNs(ValueNs::EnumVariantId(_), _)
-                if prefix_info.enum_variant =>
-            {
+            ResolveValueResult::ValueNs(ValueNs::EnumVariantId(_)) if prefix_info.enum_variant => {
                 (segments.strip_last_two(), segments.len().checked_sub(2), segments.len() - 1)
             }
             ResolveValueResult::ValueNs(..) => (segments.strip_last(), None, segments.len() - 1),
@@ -430,7 +429,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         }
 
         match &res {
-            ResolveValueResult::ValueNs(resolution, _) => {
+            ResolveValueResult::ValueNs(resolution) => {
                 let resolved_segment_idx = self.current_segment_u32();
                 let resolved_segment = self.current_or_prev_segment;
 
@@ -468,7 +467,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     | ValueNs::ConstId(_) => {}
                 }
             }
-            ResolveValueResult::Partial(resolution, _, _) => {
+            ResolveValueResult::Partial(resolution, _) => {
                 if !self.handle_type_ns_resolution(resolution) {
                     return None;
                 }
@@ -598,7 +597,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         explicit_self_ty: Option<Ty<'db>>,
         lowering_assoc_type_generics: bool,
     ) -> GenericArgs<'db> {
-        let old_lifetime_elision = self.ctx.lifetime_elision.clone();
+        let old_lifetime_elision = self.ctx.lifetime_elision;
 
         if let Some(args) = self.current_or_prev_segment.args_and_bindings
             && args.parenthesized != GenericArgsParentheses::No
@@ -639,7 +638,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             explicit_self_ty,
             PathGenericsSource::Segment(self.current_segment_u32()),
             lowering_assoc_type_generics,
-            self.ctx.lifetime_elision.clone(),
+            self.ctx.lifetime_elision,
         );
         self.ctx.lifetime_elision = old_lifetime_elision;
         result
@@ -853,7 +852,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     pub(super) fn assoc_type_bindings_from_type_bound<'c>(
         mut self,
         trait_ref: TraitRef<'db>,
-    ) -> Option<impl Iterator<Item = Clause<'db>> + use<'a, 'b, 'c, 'db>> {
+    ) -> Option<impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'b, 'c, 'db>>
+    {
         let interner = self.ctx.interner;
         self.current_or_prev_segment.args_and_bindings.map(|args_and_bindings| {
             args_and_bindings.bindings.iter().enumerate().flat_map(move |(binding_idx, binding)| {
@@ -882,7 +882,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                 assoc_type: binding_idx as u32,
                             },
                             false,
-                            this.ctx.lifetime_elision.clone(),
+                            this.ctx.lifetime_elision,
                         )
                     });
                 let args = GenericArgs::new_from_iter(
@@ -900,7 +900,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                             // `Fn()`-style generics are elided like functions. This is `Output` (we lower to it in hir-def).
                             LifetimeElisionKind::for_fn_ret(self.ctx.interner)
                         } else {
-                            self.ctx.lifetime_elision.clone()
+                            self.ctx.lifetime_elision
                         };
                     self.with_lifetime_elision(lifetime_elision, |this| {
                         match (&this.ctx.store[type_ref], this.ctx.impl_trait_mode.mode) {
@@ -921,21 +921,29 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                         ),
                                     )),
                                 ));
-                                predicates.push(pred);
+                                predicates.push((pred, GenericPredicateSource::SelfOnly));
                             }
                         }
                     })
                 }
                 for bound in binding.bounds.iter() {
-                    predicates.extend(self.ctx.lower_type_bound(
-                        bound,
-                        Ty::new_alias(
-                            self.ctx.interner,
-                            AliasTyKind::Projection,
-                            AliasTy::new_from_args(self.ctx.interner, associated_ty.into(), args),
-                        ),
-                        false,
-                    ));
+                    predicates.extend(
+                        self.ctx
+                            .lower_type_bound(
+                                bound,
+                                Ty::new_alias(
+                                    self.ctx.interner,
+                                    AliasTyKind::Projection,
+                                    AliasTy::new_from_args(
+                                        self.ctx.interner,
+                                        associated_ty.into(),
+                                        args,
+                                    ),
+                                ),
+                                false,
+                            )
+                            .map(|(pred, _)| (pred, GenericPredicateSource::AssocTyBound)),
+                    );
                 }
                 predicates
             })

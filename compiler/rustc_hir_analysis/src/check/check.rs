@@ -923,7 +923,7 @@ pub(crate) fn check_item_type(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Result<(),
                 );
                 check_where_clauses(wfcx, def_id);
 
-                if find_attr!(tcx.get_all_attrs(def_id), AttributeKind::TypeConst(_)) {
+                if tcx.is_type_const(def_id) {
                     wfcheck::check_type_const(wfcx, def_id, ty, true)?;
                 }
                 Ok(())
@@ -1175,10 +1175,32 @@ pub(super) fn check_specialization_validity<'tcx>(
 
     if let Err(parent_impl) = result {
         if !tcx.is_impl_trait_in_trait(impl_item) {
-            report_forbidden_specialization(tcx, impl_item, parent_impl);
+            let span = tcx.def_span(impl_item);
+            let ident = tcx.item_ident(impl_item);
+
+            let err = match tcx.span_of_impl(parent_impl) {
+                Ok(sp) => errors::ImplNotMarkedDefault::Ok { span, ident, ok_label: sp },
+                Err(cname) => errors::ImplNotMarkedDefault::Err { span, ident, cname },
+            };
+
+            tcx.dcx().emit_err(err);
         } else {
             tcx.dcx().delayed_bug(format!("parent item: {parent_impl:?} not marked as default"));
         }
+    }
+}
+
+fn check_overriding_final_trait_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_item: ty::AssocItem,
+    impl_item: ty::AssocItem,
+) {
+    if trait_item.defaultness(tcx).is_final() {
+        tcx.dcx().emit_err(errors::OverridingFinalTraitFunction {
+            impl_span: tcx.def_span(impl_item.def_id),
+            trait_span: tcx.def_span(trait_item.def_id),
+            ident: tcx.item_ident(impl_item.def_id),
+        });
     }
 }
 
@@ -1259,6 +1281,8 @@ fn check_impl_items_against_trait<'tcx>(
             impl_id.to_def_id(),
             impl_item,
         );
+
+        check_overriding_final_trait_item(tcx, ty_trait_item, ty_impl_item);
     }
 
     if let Ok(ancestors) = trait_def.ancestors(tcx, impl_id.to_def_id()) {

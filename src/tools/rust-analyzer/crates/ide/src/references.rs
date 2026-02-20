@@ -1079,7 +1079,7 @@ use self$0;
 use self$0;
 "#,
             expect![[r#"
-                _ Module FileId(0) 0..10
+                _ CrateRoot FileId(0) 0..10
 
                 FileId(0) 4..8 import
             "#]],
@@ -2073,6 +2073,7 @@ fn func() {}
             expect![[r#"
                 identity Attribute FileId(1) 1..107 32..40
 
+                FileId(0) 17..25 import
                 FileId(0) 43..51
             "#]],
         );
@@ -2103,6 +2104,7 @@ mirror$0! {}
             expect![[r#"
                 mirror ProcMacro FileId(1) 1..77 22..28
 
+                FileId(0) 17..23 import
                 FileId(0) 26..32
             "#]],
         )

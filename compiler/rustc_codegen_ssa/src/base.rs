@@ -911,7 +911,7 @@ impl CrateInfo {
             .rev()
             .copied()
             .filter(|&cnum| {
-                let link = !tcx.dep_kind(cnum).macros_only();
+                let link = !tcx.crate_dep_kind(cnum).macros_only();
                 if link && tcx.is_compiler_builtins(cnum) {
                     compiler_builtins = Some(cnum);
                     return false;
@@ -1111,7 +1111,7 @@ pub fn determine_cgu_reuse<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> 
     // know that later). If we are not doing LTO, there is only one optimized
     // version of each module, so we re-use that.
     let dep_node = cgu.codegen_dep_node(tcx);
-    tcx.dep_graph.assert_dep_node_not_yet_allocated_in_current_session(&dep_node, || {
+    tcx.dep_graph.assert_dep_node_not_yet_allocated_in_current_session(tcx.sess, &dep_node, || {
         format!(
             "CompileCodegenUnit dep-node for CGU `{}` already exists before marking.",
             cgu.name()

@@ -51,7 +51,7 @@ impl<'a> State<'a> {
                 expr.as_deref(),
                 vis,
                 *safety,
-                ast::Defaultness::Final,
+                ast::Defaultness::Implicit,
                 define_opaque.as_deref(),
             ),
             ast::ForeignItemKind::TyAlias(box ast::TyAlias {
@@ -201,7 +201,7 @@ impl<'a> State<'a> {
                     body.as_deref(),
                     &item.vis,
                     ast::Safety::Default,
-                    ast::Defaultness::Final,
+                    ast::Defaultness::Implicit,
                     define_opaque.as_deref(),
                 );
             }
@@ -221,7 +221,7 @@ impl<'a> State<'a> {
                 ident,
                 generics,
                 ty,
-                rhs,
+                rhs_kind,
                 define_opaque,
             }) => {
                 self.print_item_const(
@@ -229,7 +229,7 @@ impl<'a> State<'a> {
                     None,
                     generics,
                     ty,
-                    rhs.as_ref().map(|ct| ct.expr()),
+                    rhs_kind.expr(),
                     &item.vis,
                     ast::Safety::Default,
                     *defaultness,
@@ -573,7 +573,7 @@ impl<'a> State<'a> {
                 ident,
                 generics,
                 ty,
-                rhs,
+                rhs_kind,
                 define_opaque,
             }) => {
                 self.print_item_const(
@@ -581,7 +581,7 @@ impl<'a> State<'a> {
                     None,
                     generics,
                     ty,
-                    rhs.as_ref().map(|ct| ct.expr()),
+                    rhs_kind.expr(),
                     vis,
                     ast::Safety::Default,
                     *defaultness,

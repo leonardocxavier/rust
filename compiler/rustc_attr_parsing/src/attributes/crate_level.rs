@@ -274,3 +274,30 @@ impl<S: Stage> NoArgsAttributeParser<S> for NoBuiltinsParser {
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::NoBuiltins;
 }
+
+pub(crate) struct RustcPreserveUbChecksParser;
+
+impl<S: Stage> NoArgsAttributeParser<S> for RustcPreserveUbChecksParser {
+    const PATH: &[Symbol] = &[sym::rustc_preserve_ub_checks];
+    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
+    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcPreserveUbChecks;
+}
+
+pub(crate) struct RustcNoImplicitBoundsParser;
+
+impl<S: Stage> NoArgsAttributeParser<S> for RustcNoImplicitBoundsParser {
+    const PATH: &[Symbol] = &[sym::rustc_no_implicit_bounds];
+    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
+    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcNoImplicitBounds;
+}
+
+pub(crate) struct DefaultLibAllocatorParser;
+
+impl<S: Stage> NoArgsAttributeParser<S> for DefaultLibAllocatorParser {
+    const PATH: &[Symbol] = &[sym::default_lib_allocator];
+    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
+    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
+    const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::DefaultLibAllocator;
+}

@@ -7,7 +7,7 @@ use rustc_ast::tokenstream::{self, DelimSpacing, Spacing, TokenStream};
 use rustc_ast::util::literal::escape_byte_str_symbol;
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{Diag, ErrorGuaranteed, MultiSpan, PResult};
+use rustc_errors::{Diag, ErrorGuaranteed, MultiSpan};
 use rustc_parse::lexer::{StripTokens, nfc_normalize};
 use rustc_parse::parser::Parser;
 use rustc_parse::{exp, new_parser_from_source_str, source_str_to_stream, unwrap_or_emit_fatal};
@@ -103,8 +103,8 @@ impl ToInternal<token::LitKind> for LitKind {
     }
 }
 
-impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStream, Span, Symbol>> {
-    fn from_internal((stream, rustc): (TokenStream, &mut Rustc<'_, '_>)) -> Self {
+impl FromInternal<TokenStream> for Vec<TokenTree<TokenStream, Span, Symbol>> {
+    fn from_internal(stream: TokenStream) -> Self {
         use rustc_ast::token::*;
 
         // Estimate the capacity as `stream.len()` rounded up to the next power
@@ -115,22 +115,6 @@ impl FromInternal<(TokenStream, &mut Rustc<'_, '_>)> for Vec<TokenTree<TokenStre
         while let Some(tree) = iter.next() {
             let (Token { kind, span }, joint) = match tree.clone() {
                 tokenstream::TokenTree::Delimited(span, _, mut delim, mut stream) => {
-                    // We used to have an alternative behaviour for crates that
-                    // needed it: a hack used to pass AST fragments to
-                    // attribute and derive macros as a single nonterminal
-                    // token instead of a token stream. Such token needs to be
-                    // "unwrapped" and not represented as a delimited group. We
-                    // had a lint for a long time, but now we just emit a hard
-                    // error. Eventually we might remove the special case hard
-                    // error check altogether. See #73345.
-                    if let Delimiter::Invisible(InvisibleOrigin::MetaVar(kind)) = delim {
-                        crate::base::stream_pretty_printing_compatibility_hack(
-                            kind,
-                            &stream,
-                            rustc.psess(),
-                        );
-                    }
-
                     // In `mk_delimited` we avoid nesting invisible delimited
                     // of the same `MetaVarKind`. Here we do the same but
                     // ignore the `MetaVarKind` because it is discarded when we
@@ -591,7 +575,7 @@ impl server::Server for Rustc<'_, '_> {
 
     fn ts_expand_expr(&mut self, stream: &Self::TokenStream) -> Result<Self::TokenStream, ()> {
         // Parse the expression from our tokenstream.
-        let expr: PResult<'_, _> = try {
+        let expr = try {
             let mut p = Parser::new(self.psess(), stream.clone(), Some("proc_macro expand expr"));
             let expr = p.parse_expr()?;
             if p.token != token::Eof {
@@ -687,7 +671,7 @@ impl server::Server for Rustc<'_, '_> {
         &mut self,
         stream: Self::TokenStream,
     ) -> Vec<TokenTree<Self::TokenStream, Self::Span, Self::Symbol>> {
-        FromInternal::from_internal((stream, self))
+        FromInternal::from_internal(stream)
     }
 
     fn span_debug(&mut self, span: Self::Span) -> String {

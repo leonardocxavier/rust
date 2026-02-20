@@ -1,6 +1,6 @@
 // tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(if_let_guard))]
 #![feature(file_buffered)]
-#![feature(if_let_guard)]
 #![feature(impl_trait_in_assoc_type)]
 #![feature(once_cell_get_mut)]
 // tidy-alphabetical-end
@@ -19,8 +19,6 @@ mod graph_checks;
 mod mono_checks;
 mod partitioning;
 mod util;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 fn custom_coerce_unsize_info<'tcx>(
     tcx: TyCtxtAt<'tcx>,

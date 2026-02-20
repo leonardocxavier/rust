@@ -558,7 +558,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     if receiver_expr.hir_id == *arg_hir_id
                 );
                 if is_receiver {
-                    err.multipart_suggestion_verbose(
+                    err.multipart_suggestion(
                         msg,
                         vec![
                             (span.shrink_to_lo(), format!("({derefs}")),
@@ -697,7 +697,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 {
                     let mut suggestion = make_sugg(lhs, lsteps).1;
                     suggestion.append(&mut make_sugg(rhs, rsteps).1);
-                    err.multipart_suggestion_verbose(
+                    err.multipart_suggestion(
                         "consider dereferencing both sides of the expression",
                         suggestion,
                         Applicability::MachineApplicable,
@@ -707,21 +707,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     && lsteps > 0
                 {
                     let (msg, suggestion) = make_sugg(lhs, lsteps);
-                    err.multipart_suggestion_verbose(
-                        msg,
-                        suggestion,
-                        Applicability::MachineApplicable,
-                    );
+                    err.multipart_suggestion(msg, suggestion, Applicability::MachineApplicable);
                     return true;
                 } else if let Some(rsteps) = rsteps
                     && rsteps > 0
                 {
                     let (msg, suggestion) = make_sugg(rhs, rsteps);
-                    err.multipart_suggestion_verbose(
-                        msg,
-                        suggestion,
-                        Applicability::MachineApplicable,
-                    );
+                    err.multipart_suggestion(msg, suggestion, Applicability::MachineApplicable);
                     return true;
                 }
             }
@@ -954,7 +946,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
         let new_obligation =
             self.mk_trait_obligation_with_new_self_ty(obligation.param_env, trait_pred_and_self);
-        if self.predicate_must_hold_modulo_regions(&new_obligation) {
+        if !matches!(tail_expr.kind, hir::ExprKind::Err(_))
+            && self.predicate_must_hold_modulo_regions(&new_obligation)
+        {
             err.span_suggestion_short(
                 stmt.span.with_lo(tail_expr.span.hi()),
                 "remove this semicolon",
@@ -1266,7 +1260,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     };
                     match (imm_ref_self_ty_satisfies_pred, mut_ref_self_ty_satisfies_pred, mtbl) {
                         (true, _, hir::Mutability::Not) | (_, true, hir::Mutability::Mut) => {
-                            err.multipart_suggestion_verbose(
+                            err.multipart_suggestion(
                                 sugg_msg(mtbl.prefix_str()),
                                 vec![
                                     (outer.span.shrink_to_lo(), "<".to_string()),
@@ -1277,7 +1271,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         }
                         (true, _, hir::Mutability::Mut) => {
                             // There's an associated function found on the immutable borrow of the
-                            err.multipart_suggestion_verbose(
+                            err.multipart_suggestion(
                                 sugg_msg("mut "),
                                 vec![
                                     (outer.span.shrink_to_lo().until(span), "<&".to_string()),
@@ -1287,7 +1281,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             );
                         }
                         (_, true, hir::Mutability::Not) => {
-                            err.multipart_suggestion_verbose(
+                            err.multipart_suggestion(
                                 sugg_msg(""),
                                 vec![
                                     (outer.span.shrink_to_lo().until(span), "<&mut ".to_string()),
@@ -1606,11 +1600,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     format!("consider removing {count} leading `&`-references")
                 };
 
-                err.multipart_suggestion_verbose(
-                    msg,
-                    suggestions,
-                    Applicability::MachineApplicable,
-                );
+                err.multipart_suggestion(msg, suggestions, Applicability::MachineApplicable);
                 true
             } else {
                 false
@@ -3271,7 +3261,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                     (ty.span.shrink_to_hi(), ")".to_string()),
                                 ]
                             };
-                            err.multipart_suggestion_verbose(
+                            err.multipart_suggestion(
                                 borrowed_msg,
                                 sugg,
                                 Applicability::MachineApplicable,
@@ -3348,7 +3338,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     "&",
                     Applicability::MachineApplicable,
                 );
-                err.multipart_suggestion_verbose(
+                err.multipart_suggestion(
                     "the `Box` type always has a statically known size and allocates its contents \
                      in the heap",
                     vec![
@@ -3581,11 +3571,14 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         ..
                     })) => {
                         let mut spans = Vec::with_capacity(2);
-                        if let Some(of_trait) = of_trait {
+                        if let Some(of_trait) = of_trait
+                            && !of_trait.trait_ref.path.span.in_derive_expansion()
+                        {
                             spans.push(of_trait.trait_ref.path.span);
                         }
                         spans.push(self_ty.span);
                         let mut spans: MultiSpan = spans.into();
+                        let mut derived = false;
                         if matches!(
                             self_ty.span.ctxt().outer_expn_data().kind,
                             ExpnKind::Macro(MacroKind::Derive, _)
@@ -3593,9 +3586,14 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             of_trait.map(|t| t.trait_ref.path.span.ctxt().outer_expn_data().kind),
                             Some(ExpnKind::Macro(MacroKind::Derive, _))
                         ) {
+                            derived = true;
                             spans.push_span_label(
                                 data.span,
-                                "unsatisfied trait bound introduced in this `derive` macro",
+                                if data.span.in_derive_expansion() {
+                                    format!("type parameter would need to implement `{trait_name}`")
+                                } else {
+                                    format!("unsatisfied trait bound")
+                                },
                             );
                         } else if !data.span.is_dummy() && !data.span.overlaps(self_ty.span) {
                             // `Sized` may be an explicit or implicit trait bound. If it is
@@ -3621,6 +3619,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             }
                         }
                         err.span_note(spans, msg);
+                        if derived && trait_name != "Copy" {
+                            err.help(format!(
+                                "consider manually implementing `{trait_name}` to avoid undesired \
+                                 bounds",
+                            ));
+                        }
                         point_at_assoc_type_restriction(
                             tcx,
                             err,
@@ -4833,7 +4837,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     suggestions.push((span.shrink_to_lo(), "&".into()));
                 }
                 suggestions.push((span.shrink_to_hi(), "[..]".into()));
-                err.multipart_suggestion_verbose(msg, suggestions, Applicability::MaybeIncorrect);
+                err.multipart_suggestion(msg, suggestions, Applicability::MaybeIncorrect);
             } else {
                 err.span_help(span, msg);
             }
@@ -4868,7 +4872,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
         if self.predicate_must_hold_modulo_regions(&obligation) {
             let arg_span = self.tcx.hir_span(*arg_hir_id);
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 format!("use a unary tuple instead"),
                 vec![(arg_span.shrink_to_lo(), "(".into()), (arg_span.shrink_to_hi(), ",)".into())],
                 Applicability::MaybeIncorrect,
@@ -5162,7 +5166,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     ),
                 ));
             }
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 format!("consider adding return type"),
                 sugg_spans,
                 Applicability::MaybeIncorrect,
@@ -5252,7 +5256,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             suggs.push((span, suggestion));
         }
 
-        err.multipart_suggestion_verbose(
+        err.multipart_suggestion(
             "consider relaxing the implicit `Sized` restriction",
             suggs,
             Applicability::MachineApplicable,
@@ -5592,15 +5596,17 @@ pub(super) fn get_explanation_based_on_obligation<'tcx>(
             None => String::new(),
         };
         if let ty::PredicatePolarity::Positive = trait_predicate.polarity() {
+            // If the trait in question is unstable, mention that fact in the diagnostic.
+            // But if we're building with `-Zforce-unstable-if-unmarked` then _any_ trait
+            // not explicitly marked stable is considered unstable, so the extra text is
+            // unhelpful noise. See <https://github.com/rust-lang/rust/issues/152692>.
+            let mention_unstable = !tcx.sess.opts.unstable_opts.force_unstable_if_unmarked
+                && try { tcx.lookup_stability(trait_predicate.def_id())?.level.is_stable() }
+                    == Some(false);
+            let unstable = if mention_unstable { "nightly-only, unstable " } else { "" };
+
             format!(
-                "{pre_message}the {}trait `{}` is not implemented for{desc} `{}`",
-                if tcx.lookup_stability(trait_predicate.def_id()).map(|s| s.level.is_stable())
-                    == Some(false)
-                {
-                    "nightly-only, unstable "
-                } else {
-                    ""
-                },
+                "{pre_message}the {unstable}trait `{}` is not implemented for{desc} `{}`",
                 trait_predicate.print_modifiers_and_trait_path(),
                 tcx.short_string(trait_predicate.self_ty().skip_binder(), long_ty_path),
             )

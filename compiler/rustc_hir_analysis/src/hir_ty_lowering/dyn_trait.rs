@@ -451,17 +451,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 } else {
                     let reason =
                         if let hir::LifetimeKind::ImplicitObjectLifetimeDefault = lifetime.kind {
-                            if let hir::Node::Ty(hir::Ty {
-                                kind: hir::TyKind::Ref(parent_lifetime, _),
-                                ..
-                            }) = tcx.parent_hir_node(hir_id)
-                                && tcx.named_bound_var(parent_lifetime.hir_id).is_none()
-                            {
-                                // Parent lifetime must have failed to resolve. Don't emit a redundant error.
-                                RegionInferReason::ExplicitObjectLifetime
-                            } else {
-                                RegionInferReason::ObjectLifetimeDefault
-                            }
+                            RegionInferReason::ObjectLifetimeDefault(span.shrink_to_hi())
                         } else {
                             RegionInferReason::ExplicitObjectLifetime
                         };
@@ -592,7 +582,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             if span.can_be_used_for_suggestions()
                 && poly_trait_ref.trait_ref.trait_def_id().is_some()
                 && !self.maybe_suggest_impl_trait(span, hir_id, hir_bounds, &mut diag)
-                && !self.maybe_suggest_dyn_trait(hir_id, sugg, &mut diag)
+                && !self.maybe_suggest_dyn_trait(hir_id, span, sugg, &mut diag)
             {
                 self.maybe_suggest_add_generic_impl_trait(span, hir_id, &mut diag);
             }
@@ -619,7 +609,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
             tcx.node_span_lint(BARE_TRAIT_OBJECTS, hir_id, span, |lint| {
                 lint.primary_message("trait objects without an explicit `dyn` are deprecated");
                 if span.can_be_used_for_suggestions() {
-                    lint.multipart_suggestion_verbose(
+                    lint.multipart_suggestion(
                         "if this is a dyn-compatible trait, use `dyn`",
                         sugg,
                         Applicability::MachineApplicable,
@@ -684,7 +674,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         } else {
             sugg.push((generics.where_clause_span, format!("<{param}: {}>", rendered_ty)));
         }
-        diag.multipart_suggestion_verbose(
+        diag.multipart_suggestion(
             "you might be missing a type parameter",
             sugg,
             Applicability::MachineApplicable,
@@ -750,10 +740,14 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
     fn maybe_suggest_dyn_trait(
         &self,
         hir_id: hir::HirId,
+        span: Span,
         sugg: Vec<(Span, String)>,
         diag: &mut Diag<'_>,
     ) -> bool {
         let tcx = self.tcx();
+        if span.in_derive_expansion() {
+            return false;
+        }
 
         // Look at the direct HIR parent, since we care about the relationship between
         // the type and the thing that directly encloses it.
@@ -791,7 +785,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
         }
 
         // FIXME: Only emit this suggestion if the trait is dyn-compatible.
-        diag.multipart_suggestion_verbose(
+        diag.multipart_suggestion(
             "you can add the `dyn` keyword if you want a trait object",
             sugg,
             Applicability::MachineApplicable,
@@ -877,7 +871,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                  single underlying type",
             );
 
-            diag.multipart_suggestion_verbose(msg, impl_sugg, Applicability::MachineApplicable);
+            diag.multipart_suggestion(msg, impl_sugg, Applicability::MachineApplicable);
 
             // Suggest `Box<dyn Trait>` for return type
             if is_dyn_compatible {
@@ -893,7 +887,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     ]
                 };
 
-                diag.multipart_suggestion_verbose(
+                diag.multipart_suggestion(
                     "alternatively, you can return an owned trait object",
                     suggestion,
                     Applicability::MachineApplicable,
@@ -908,12 +902,12 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 continue;
             }
             let sugg = self.add_generic_param_suggestion(generics, span, &trait_name);
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 format!("use a new generic type parameter, constrained by `{trait_name}`"),
                 sugg,
                 Applicability::MachineApplicable,
             );
-            diag.multipart_suggestion_verbose(
+            diag.multipart_suggestion(
                 "you can also use an opaque type, but users won't be able to specify the type \
                  parameter when calling the `fn`, having to rely exclusively on type inference",
                 impl_sugg,
@@ -937,7 +931,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                 } else {
                     vec![(span.shrink_to_lo(), dyn_str.to_string())]
                 };
-                diag.multipart_suggestion_verbose(
+                diag.multipart_suggestion(
                     format!(
                         "alternatively, use a trait object to accept any type that implements \
                          `{trait_name}`, accessing its methods at runtime using dynamic dispatch",

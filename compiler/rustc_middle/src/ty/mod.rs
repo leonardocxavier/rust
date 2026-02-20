@@ -47,7 +47,6 @@ use rustc_macros::{
     BlobDecodable, Decodable, Encodable, HashStable, TyDecodable, TyEncodable, TypeFoldable,
     TypeVisitable, extension,
 };
-use rustc_query_system::ich::StableHashingContext;
 use rustc_serialize::{Decodable, Encodable};
 pub use rustc_session::lint::RegisteredTools;
 use rustc_span::hygiene::MacroKind;
@@ -76,8 +75,9 @@ pub use self::closure::{
     place_to_string_for_capture,
 };
 pub use self::consts::{
-    AnonConstKind, AtomicOrdering, Const, ConstInt, ConstKind, ConstToValTreeResult, Expr,
-    ExprKind, ScalarInt, SimdAlign, UnevaluatedConst, ValTree, ValTreeKindExt, Value,
+    AtomicOrdering, Const, ConstInt, ConstKind, ConstToValTreeResult, Expr, ExprKind,
+    LitToConstInput, ScalarInt, SimdAlign, UnevaluatedConst, ValTree, ValTreeKindExt, Value,
+    const_lit_matches_ty,
 };
 pub use self::context::{
     CtxtInterners, CurrentGcx, Feed, FreeRegionInfo, GlobalCtxt, Lift, TyCtxt, TyCtxtFeed, tls,
@@ -111,6 +111,7 @@ pub use self::typeck_results::{
     Rust2024IncompatiblePatInfo, TypeckResults, UserType, UserTypeAnnotationIndex, UserTypeKind,
 };
 use crate::error::{OpaqueHiddenTypeMismatch, TypeMismatchReason};
+use crate::ich::StableHashingContext;
 use crate::metadata::{AmbigModChild, ModChild};
 use crate::middle::privacy::EffectiveVisibilities;
 use crate::mir::{Body, CoroutineLayout, CoroutineSavedLocal, SourceInfo};
@@ -405,6 +406,12 @@ impl<Id: Into<DefId>> Visibility<Id> {
             Visibility::Public => self.is_public(),
             Visibility::Restricted(id) => self.is_accessible_from(id, tcx),
         }
+    }
+}
+
+impl<Id: Into<DefId> + Copy> Visibility<Id> {
+    pub fn min(self, vis: Visibility<Id>, tcx: TyCtxt<'_>) -> Visibility<Id> {
+        if self.is_at_least(vis, tcx) { vis } else { self }
     }
 }
 

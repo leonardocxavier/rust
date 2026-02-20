@@ -15,11 +15,13 @@ use rustc_attr_parsing::{
     AttributeParser, CFG_TEMPLATE, EvalConfigResult, ShouldEmit, eval_config_entry, parse_cfg,
 };
 use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
+use rustc_errors::msg;
 use rustc_feature::{
     ACCEPTED_LANG_FEATURES, EnabledLangFeature, EnabledLibFeature, Features, REMOVED_LANG_FEATURES,
     UNSTABLE_LANG_FEATURES,
 };
 use rustc_hir::Target;
+use rustc_parse::parser::Recovery;
 use rustc_session::Session;
 use rustc_session::parse::feature_err;
 use rustc_span::{STDLIB_STABLE_CRATES, Span, Symbol, sym};
@@ -84,8 +86,7 @@ pub fn features(sess: &Session, krate_attrs: &[Attribute], crate_name: Symbol) -
             if let Some(f) = REMOVED_LANG_FEATURES.iter().find(|f| name == f.feature.name) {
                 let pull_note = if let Some(pull) = f.pull {
                     format!(
-                        "; see <https://github.com/rust-lang/rust/pull/{}> for more information",
-                        pull
+                        "; see <https://github.com/rust-lang/rust/pull/{pull}> for more information",
                     )
                 } else {
                     "".to_owned()
@@ -121,7 +122,7 @@ pub fn features(sess: &Session, krate_attrs: &[Attribute], crate_name: Symbol) -
 
             // If the enabled feature is unstable, record it.
             if UNSTABLE_LANG_FEATURES.iter().find(|f| name == f.name).is_some() {
-                // When the ICE comes a standard library crate, there's a chance that the person
+                // When the ICE comes from a standard library crate, there's a chance that the person
                 // hitting the ICE may be using -Zbuild-std or similar with an untested target.
                 // The bug is probably in the standard library and not the compiler in that case,
                 // but that doesn't really matter - we want a bug report.
@@ -395,7 +396,9 @@ impl<'a> StripUnconfigured<'a> {
     fn in_cfg(&self, attrs: &[Attribute]) -> bool {
         attrs.iter().all(|attr| {
             !is_cfg(attr)
-                || self.cfg_true(attr, ShouldEmit::ErrorsAndLints { recover: true }).as_bool()
+                || self
+                    .cfg_true(attr, ShouldEmit::ErrorsAndLints { recovery: Recovery::Allowed })
+                    .as_bool()
         })
     }
 
@@ -429,14 +432,14 @@ impl<'a> StripUnconfigured<'a> {
                 &self.sess,
                 sym::stmt_expr_attributes,
                 attr.span,
-                crate::fluent_generated::expand_attributes_on_expressions_experimental,
+                msg!("attributes on expressions are experimental"),
             );
 
             if attr.is_doc_comment() {
                 err.help(if attr.style == AttrStyle::Outer {
-                    crate::fluent_generated::expand_help_outer_doc
+                    msg!("`///` is used for outer documentation comments; for a plain comment, use `//`")
                 } else {
-                    crate::fluent_generated::expand_help_inner_doc
+                    msg!("`//!` is used for inner documentation comments; for a plain comment, use `//` by removing the `!` or inserting a space in between them: `// !`")
                 });
             }
 

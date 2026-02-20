@@ -11,7 +11,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::unord::UnordSet;
 use rustc_errors::codes::*;
 use rustc_errors::{
-    Applicability, Diag, ErrorGuaranteed, Level, MultiSpan, StashKey, StringPart, Suggestions,
+    Applicability, Diag, ErrorGuaranteed, Level, MultiSpan, StashKey, StringPart, Suggestions, msg,
     pluralize, struct_span_code_err,
 };
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
@@ -254,9 +254,16 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             LangItem::TransmuteTrait,
                         ) {
                             // Recompute the safe transmute reason and use that for the error reporting
+                            let (report_obligation, report_pred) =
+                                self.select_transmute_obligation_for_reporting(
+                                    &obligation,
+                                    main_trait_predicate,
+                                    root_obligation,
+                                );
+
                             match self.get_safe_transmute_error_and_reason(
-                                obligation.clone(),
-                                main_trait_predicate,
+                                report_obligation,
+                                report_pred,
                                 span,
                             ) {
                                 GetSafeTransmuteErrorAndReason::Silent => {
@@ -277,6 +284,36 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         };
 
                         let mut err = struct_span_code_err!(self.dcx(), span, E0277, "{}", err_msg);
+
+                        let trait_def_id = main_trait_predicate.def_id();
+                        if self.tcx.is_diagnostic_item(sym::From, trait_def_id)
+                            || self.tcx.is_diagnostic_item(sym::TryFrom, trait_def_id)
+                        {
+                            let trait_ref = leaf_trait_predicate.skip_binder().trait_ref;
+
+                            // Defensive: next-solver may produce fewer args than expected.
+                            if trait_ref.args.len() > 1 {
+                                let found_ty = trait_ref.args.type_at(1);
+                                let ty = main_trait_predicate.skip_binder().self_ty();
+
+                                if let Some(cast_ty) = self.find_explicit_cast_type(
+                                    obligation.param_env,
+                                    found_ty,
+                                    ty,
+                                ) {
+                                    let found_ty_str =
+                                        self.tcx.short_string(found_ty, &mut long_ty_file);
+                                    let cast_ty_str =
+                                        self.tcx.short_string(cast_ty, &mut long_ty_file);
+
+                                    err.help(format!(
+                                        "consider casting the `{found_ty_str}` value to `{cast_ty_str}`",
+                                    ));
+                                }
+                            }
+                        }
+
+
                         *err.long_ty_path() = long_ty_file;
 
                         let mut suggested = false;
@@ -1607,6 +1644,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         };
 
                     if let Some(lhs) = lhs.to_alias_term()
+                        && let ty::AliasTermKind::ProjectionTy | ty::AliasTermKind::ProjectionConst = lhs.kind(self.tcx)
                         && let Some((better_type_err, expected_term)) =
                             derive_better_type_error(lhs, rhs)
                     {
@@ -1615,6 +1653,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             better_type_err,
                         )
                     } else if let Some(rhs) = rhs.to_alias_term()
+                        && let ty::AliasTermKind::ProjectionTy | ty::AliasTermKind::ProjectionConst = rhs.kind(self.tcx)
                         && let Some((better_type_err, expected_term)) =
                             derive_better_type_error(rhs, lhs)
                     {
@@ -2239,7 +2278,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 err.highlighted_span_help(
                     self.tcx.def_span(def_id),
                     vec![
-                        StringPart::normal(format!("the trait `{trait_}` ",)),
+                        StringPart::normal(format!("the trait `{trait_}` ")),
                         StringPart::highlighted("is"),
                         StringPart::normal(desc),
                         StringPart::highlighted(self_ty),
@@ -2793,6 +2832,51 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             })
     }
 
+    fn select_transmute_obligation_for_reporting(
+        &self,
+        obligation: &PredicateObligation<'tcx>,
+        trait_predicate: ty::PolyTraitPredicate<'tcx>,
+        root_obligation: &PredicateObligation<'tcx>,
+    ) -> (PredicateObligation<'tcx>, ty::PolyTraitPredicate<'tcx>) {
+        let ocx = ObligationCtxt::new(self);
+        let normalized_predicate = self.tcx.erase_and_anonymize_regions(
+            self.tcx.instantiate_bound_regions_with_erased(trait_predicate),
+        );
+        let trait_ref = normalized_predicate.trait_ref;
+
+        let Ok(assume) = ocx.structurally_normalize_const(
+            &obligation.cause,
+            obligation.param_env,
+            trait_ref.args.const_at(2),
+        ) else {
+            return (obligation.clone(), trait_predicate);
+        };
+
+        let Some(assume) = rustc_transmute::Assume::from_const(self.tcx, assume) else {
+            return (obligation.clone(), trait_predicate);
+        };
+
+        let is_normalized_yes = matches!(
+            rustc_transmute::TransmuteTypeEnv::new(self.tcx).is_transmutable(
+                trait_ref.args.type_at(1),
+                trait_ref.args.type_at(0),
+                assume,
+            ),
+            rustc_transmute::Answer::Yes,
+        );
+
+        // If the normalized check unexpectedly passes, fall back to root obligation for reporting.
+        if is_normalized_yes
+            && let ty::PredicateKind::Clause(ty::ClauseKind::Trait(root_pred)) =
+                root_obligation.predicate.kind().skip_binder()
+            && root_pred.def_id() == trait_predicate.def_id()
+        {
+            return (root_obligation.clone(), root_obligation.predicate.kind().rebind(root_pred));
+        }
+
+        (obligation.clone(), trait_predicate)
+    }
+
     fn get_safe_transmute_error_and_reason(
         &self,
         obligation: PredicateObligation<'tcx>,
@@ -2930,6 +3014,69 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         })
     }
 
+    /// If `found_ty` is a reference that can be explicitly cast to another reference type for which
+    /// a `From` / `TryFrom` impl exists for `self_ty`, return that type.
+    fn find_explicit_cast_type(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        found_ty: Ty<'tcx>,
+        self_ty: Ty<'tcx>,
+    ) -> Option<Ty<'tcx>> {
+        let ty::Ref(region, inner_ty, mutbl) = *found_ty.kind() else {
+            return None;
+        };
+
+        let mut derefs = (self.autoderef_steps)(inner_ty).into_iter();
+        derefs.next(); // skip the first one, which is inner_ty itself
+        let deref_target = derefs.into_iter().next()?.0;
+
+        let cast_ty = Ty::new_ref(self.tcx, region, deref_target, mutbl);
+
+        let Some(from_def_id) = self.tcx.get_diagnostic_item(sym::From) else {
+            return None;
+        };
+        let Some(try_from_def_id) = self.tcx.get_diagnostic_item(sym::TryFrom) else {
+            return None;
+        };
+
+        if self.has_impl_for_type(
+            param_env,
+            ty::TraitRef::new(
+                self.tcx,
+                from_def_id,
+                self.tcx.mk_args(&[self_ty.into(), cast_ty.into()]),
+            ),
+        ) {
+            Some(cast_ty)
+        } else if self.has_impl_for_type(
+            param_env,
+            ty::TraitRef::new(
+                self.tcx,
+                try_from_def_id,
+                self.tcx.mk_args(&[self_ty.into(), cast_ty.into()]),
+            ),
+        ) {
+            Some(cast_ty)
+        } else {
+            None
+        }
+    }
+
+    fn has_impl_for_type(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        trait_ref: ty::TraitRef<'tcx>,
+    ) -> bool {
+        let obligation = Obligation::new(
+            self.tcx,
+            ObligationCause::dummy(),
+            param_env,
+            ty::TraitPredicate { trait_ref, polarity: ty::PredicatePolarity::Positive },
+        );
+
+        self.predicate_must_hold_modulo_regions(&obligation)
+    }
+
     fn add_tuple_trait_message(
         &self,
         obligation_cause_code: &ObligationCauseCode<'tcx>,
@@ -3001,7 +3148,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         {
             err.span_help(
                 self.tcx.def_span(trait_def_id),
-                crate::fluent_generated::trait_selection_trait_has_no_impls,
+                msg!("this trait has no implementations, consider adding one"),
             );
         } else if !suggested && trait_predicate.polarity() == ty::PredicatePolarity::Positive {
             // Can't show anything else useful, try to find similar impls.
