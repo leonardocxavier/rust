@@ -24,11 +24,9 @@ use itertools::Itertools;
 use rustc_abi::{ExternAbi, FieldIdx};
 use rustc_apfloat::Float;
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
-use rustc_ast::attr;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedIndexMultiMap;
 use rustc_errors::ErrorGuaranteed;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::{self as hir, BindingMode, ByRef, HirId, ItemLocalId, Node, find_attr};
@@ -42,7 +40,7 @@ use rustc_middle::thir::{self, ExprId, LocalVarId, Param, ParamId, PatKind, Thir
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt, TypeVisitableExt, TypingMode};
 use rustc_middle::{bug, span_bug};
 use rustc_session::lint;
-use rustc_span::{Span, Symbol, sym};
+use rustc_span::{Span, Symbol};
 
 use crate::builder::expr::as_place::PlaceBuilder;
 use crate::builder::scope::{DropKind, LintLevel};
@@ -70,11 +68,11 @@ pub(crate) fn closure_saved_names_of_captured_variables<'tcx>(
 /// be called by the query `mir_built`.
 pub(crate) fn build_mir_inner_impl<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> Body<'tcx> {
     tcx.ensure_done().thir_abstract_const(def);
-    if let Err(e) = tcx.ensure_ok().check_match(def) {
+    if let Err(e) = tcx.ensure_result().check_match(def) {
         return construct_error(tcx, def, e);
     }
 
-    if let Err(err) = tcx.ensure_ok().check_tail_calls(def) {
+    if let Err(err) = tcx.ensure_result().check_tail_calls(def) {
         return construct_error(tcx, def, err);
     }
 
@@ -472,7 +470,7 @@ fn construct_fn<'tcx>(
         .output
         .span();
 
-    let mut abi = fn_sig.abi;
+    let mut abi = fn_sig.abi();
     if let DefKind::Closure = tcx.def_kind(fn_def) {
         // HACK(eddyb) Avoid having RustCall on closures,
         // as it adds unnecessary (and wrong) auto-tupling.
@@ -482,7 +480,7 @@ fn construct_fn<'tcx>(
     let arguments = &thir.params;
 
     let return_ty = fn_sig.output();
-    let coroutine = match tcx.type_of(fn_def).instantiate_identity().kind() {
+    let coroutine = match tcx.type_of(fn_def).instantiate_identity().skip_norm_wip().kind() {
         ty::Coroutine(_, args) => Some(Box::new(CoroutineInfo::initial(
             tcx.coroutine_kind(fn_def).unwrap(),
             args.as_coroutine().yield_ty(),
@@ -492,7 +490,8 @@ fn construct_fn<'tcx>(
         ty => span_bug!(span_with_body, "unexpected type of body: {ty:?}"),
     };
 
-    if let Some((dialect, phase)) = find_attr!(tcx.hir_attrs(fn_id), AttributeKind::CustomMir(dialect, phase, _) => (dialect, phase))
+    if let Some((dialect, phase)) =
+        find_attr!(tcx, fn_id, CustomMir(dialect, phase, _) => (dialect, phase))
     {
         return custom::build_custom_mir(
             tcx,
@@ -618,21 +617,23 @@ fn construct_error(tcx: TyCtxt<'_>, def_id: LocalDefId, guar: ErrorGuaranteed) -
     let hir_id = tcx.local_def_id_to_hir_id(def_id);
 
     let (inputs, output, coroutine) = match tcx.def_kind(def_id) {
-        DefKind::Const
-        | DefKind::AssocConst
+        DefKind::Const { .. }
+        | DefKind::AssocConst { .. }
         | DefKind::AnonConst
         | DefKind::InlineConst
         | DefKind::Static { .. }
-        | DefKind::GlobalAsm => (vec![], tcx.type_of(def_id).instantiate_identity(), None),
+        | DefKind::GlobalAsm => {
+            (vec![], tcx.type_of(def_id).instantiate_identity().skip_norm_wip(), None)
+        }
         DefKind::Ctor(..) | DefKind::Fn | DefKind::AssocFn => {
             let sig = tcx.liberate_late_bound_regions(
                 def_id.to_def_id(),
-                tcx.fn_sig(def_id).instantiate_identity(),
+                tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip(),
             );
             (sig.inputs().to_vec(), sig.output(), None)
         }
         DefKind::Closure => {
-            let closure_ty = tcx.type_of(def_id).instantiate_identity();
+            let closure_ty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
             match closure_ty.kind() {
                 ty::Closure(_, args) => {
                     let args = args.as_closure();
@@ -751,11 +752,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         coroutine: Option<Box<CoroutineInfo<'tcx>>>,
     ) -> Builder<'a, 'tcx> {
         let tcx = infcx.tcx;
-        let attrs = tcx.hir_attrs(hir_id);
         // Some functions always have overflow checks enabled,
         // however, they may not get codegen'd, depending on
         // the settings for the crate they are codegened in.
-        let mut check_overflow = attr::contains_name(attrs, sym::rustc_inherit_overflow_checks);
+        let mut check_overflow = find_attr!(tcx.hir_attrs(hir_id), RustcInheritOverflowChecks);
         // Respect -C overflow-checks.
         check_overflow |= tcx.sess.overflow_checks();
         // Constants always need overflow checks.
@@ -857,9 +857,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // https://github.com/rust-lang/rust/issues/149571
                     && self
                         .tcx
-                        .fn_sig(self.def_id)
-                        .instantiate_identity()
-                        .skip_binder()
+                        .fn_sig(self.def_id).instantiate_identity().skip_binder()
                         .output()
                         .is_inhabited_from(
                             self.tcx,

@@ -4,7 +4,6 @@ use hir::{
 };
 use ide_db::{
     FileId, FxHashMap, FxHashSet, RootDatabase, SnippetCap,
-    assists::ExprFillDefaultMode,
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
     helpers::is_editable_crate,
@@ -24,7 +23,7 @@ use syntax::{
 
 use crate::{
     AssistContext, AssistId, Assists,
-    utils::{convert_reference_type, find_struct_impl},
+    utils::{convert_reference_type, expr_fill_default, find_struct_impl},
 };
 
 // Assist: generate_function
@@ -147,7 +146,16 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         return None;
     }
 
-    let (impl_, file) = get_adt_source(ctx, &adt, fn_name.text().as_str())?;
+    let enclosing_impl = ctx.find_node_at_offset::<ast::Impl>();
+    let cursor_impl = enclosing_impl.filter(|impl_| {
+        ctx.sema.to_def(impl_).map_or(false, |def| def.self_ty(ctx.sema.db).as_adt() == Some(adt))
+    });
+
+    let (impl_, file) = if let Some(impl_) = cursor_impl {
+        (Some(impl_), ctx.vfs_file_id())
+    } else {
+        get_adt_source(ctx, &adt, fn_name.text().as_str())?
+    };
     let target = get_method_target(ctx, &impl_, &adt)?;
 
     let function_builder = FunctionBuilder::from_method_call(
@@ -277,11 +285,7 @@ impl FunctionBuilder {
                 target_module,
                 &mut necessary_generic_params,
             );
-            let placeholder_expr = match ctx.config.expr_fill_default {
-                ExprFillDefaultMode::Todo => make::ext::expr_todo(),
-                ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
-                ExprFillDefaultMode::Default => make::ext::expr_todo(),
-            };
+            let placeholder_expr = expr_fill_default(ctx.config);
             fn_body = make::block_expr(vec![], Some(placeholder_expr));
         };
 
@@ -336,11 +340,7 @@ impl FunctionBuilder {
         let (generic_param_list, where_clause) =
             fn_generic_params(ctx, necessary_generic_params, &target)?;
 
-        let placeholder_expr = match ctx.config.expr_fill_default {
-            ExprFillDefaultMode::Todo => make::ext::expr_todo(),
-            ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
-            ExprFillDefaultMode::Default => make::ext::expr_todo(),
-        };
+        let placeholder_expr = expr_fill_default(ctx.config);
         let fn_body = make::block_expr(vec![], Some(placeholder_expr));
 
         Some(Self {
@@ -456,11 +456,7 @@ fn make_fn_body_as_new_function(
     let adt_info = adt_info.as_ref()?;
 
     let path_self = make::ext::ident_path("Self");
-    let placeholder_expr = match ctx.config.expr_fill_default {
-        ExprFillDefaultMode::Todo => make::ext::expr_todo(),
-        ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
-        ExprFillDefaultMode::Default => make::ext::expr_todo(),
-    };
+    let placeholder_expr = expr_fill_default(ctx.config);
     let tail_expr = if let Some(strukt) = adt_info.adt.as_struct() {
         match strukt.kind(ctx.db()) {
             StructKind::Record => {
@@ -1170,10 +1166,10 @@ fn next_space_for_fn_after_call_site(expr: ast::CallableExpr) -> Option<Generate
             SyntaxKind::SOURCE_FILE => {
                 break;
             }
-            SyntaxKind::ITEM_LIST => {
-                if ancestors.peek().map(|a| a.kind()) == Some(SyntaxKind::MODULE) {
-                    break;
-                }
+            SyntaxKind::ITEM_LIST
+                if ancestors.peek().map(|a| a.kind()) == Some(SyntaxKind::MODULE) =>
+            {
+                break;
             }
             _ => {}
         }
@@ -3205,5 +3201,45 @@ fn bar(arg: impl Fn(_) -> bool) {
 }
         "#,
         );
+    }
+    #[test]
+    fn generate_method_uses_current_impl_block() {
+        check_assist(
+            generate_function,
+            r"
+struct Foo;
+
+impl Foo {
+    fn new() -> Self {
+        Foo
+    }
+}
+
+impl Foo {
+    fn method1(&self) {
+        self.method2$0(42)
+    }
+}
+",
+            r"
+struct Foo;
+
+impl Foo {
+    fn new() -> Self {
+        Foo
+    }
+}
+
+impl Foo {
+    fn method1(&self) {
+        self.method2(42)
+    }
+
+    fn method2(&self, arg: i32) {
+        ${0:todo!()}
+    }
+}
+",
+        )
     }
 }

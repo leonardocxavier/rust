@@ -1,7 +1,6 @@
 //@ run-pass
 
 #![feature(fn_delegation)]
-#![allow(incomplete_features)]
 
 mod to_reuse {
     pub fn foo(x: i32) -> i32 { x }
@@ -25,7 +24,7 @@ struct S(F); //~ WARN struct `S` is never constructed
 impl Trait for S {
     reuse <F as Trait>::bar {
         #[allow(unused_imports)]
-        use self::to_reuse::{foo, inner::self};
+        use self::to_reuse::{foo, inner::{self}};
         let x = foo(12);
         assert_eq!(x, 12);
         &self.0

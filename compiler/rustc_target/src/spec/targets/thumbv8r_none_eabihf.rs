@@ -1,13 +1,13 @@
 // Targets the Little-endian Cortex-R52 processor (ARMv8-R)
 
-use crate::spec::{Abi, Arch, FloatAbi, Target, TargetMetadata, TargetOptions, base};
+use crate::spec::{Arch, CfgAbi, FloatAbi, Target, TargetMetadata, TargetOptions, base};
 
 pub(crate) fn target() -> Target {
     Target {
         llvm_target: "thumbv8r-none-eabihf".into(),
         metadata: TargetMetadata {
             description: Some("Thumb-mode Bare Armv8-R, hardfloat".into()),
-            tier: Some(2),
+            tier: Some(3),
             host_tools: Some(false),
             std: Some(false),
         },
@@ -16,7 +16,7 @@ pub(crate) fn target() -> Target {
         arch: Arch::Arm,
 
         options: TargetOptions {
-            abi: Abi::EabiHf,
+            cfg_abi: CfgAbi::EabiHf,
             llvm_floatabi: Some(FloatAbi::Hard),
             // Armv8-R requires a minimum set of floating-point features equivalent to:
             // fp-armv8, SP-only, with 16 DP (32 SP) registers

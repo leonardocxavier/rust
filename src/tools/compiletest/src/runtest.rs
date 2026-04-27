@@ -22,7 +22,7 @@ use crate::directives::{AuxCrate, TestProps};
 use crate::errors::{Error, ErrorKind, load_errors};
 use crate::output_capture::ConsoleOut;
 use crate::read2::{Truncated, read2_abbreviated};
-use crate::runtest::compute_diff::{DiffLine, make_diff, write_diff};
+use crate::runtest::compute_diff::{DiffLine, diff_by_lines, make_diff, write_diff};
 use crate::util::{Utf8PathBufExt, add_dylib_path, static_regex};
 use crate::{json, stamp_file_path};
 
@@ -106,7 +106,7 @@ fn dylib_name(name: &str) -> String {
     format!("{}{name}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION)
 }
 
-pub fn run(
+pub(crate) fn run(
     config: &Config,
     stdout: &dyn ConsoleOut,
     stderr: &dyn ConsoleOut,
@@ -181,7 +181,7 @@ pub fn run(
     cx.create_stamp();
 }
 
-pub fn compute_stamp_hash(config: &Config) -> String {
+pub(crate) fn compute_stamp_hash(config: &Config) -> String {
     let mut hash = DefaultHasher::new();
     config.stage_id.hash(&mut hash);
     config.run.hash(&mut hash);
@@ -266,28 +266,26 @@ impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
     /// revisions, exactly once, with revision == None).
     fn run_revision(&self) {
-        if self.props.should_ice
-            && self.config.mode != TestMode::Incremental
-            && self.config.mode != TestMode::Crashes
-        {
-            self.fatal("cannot use should-ice in a test that is not cfail");
-        }
-        match self.config.mode {
-            TestMode::Pretty => self.run_pretty_test(),
-            TestMode::DebugInfo => self.run_debuginfo_test(),
-            TestMode::Codegen => self.run_codegen_test(),
-            TestMode::RustdocHtml => self.run_rustdoc_html_test(),
-            TestMode::RustdocJson => self.run_rustdoc_json_test(),
-            TestMode::CodegenUnits => self.run_codegen_units_test(),
-            TestMode::Incremental => self.run_incremental_test(),
-            TestMode::RunMake => self.run_rmake_test(),
-            TestMode::Ui => self.run_ui_test(),
-            TestMode::MirOpt => self.run_mir_opt_test(),
-            TestMode::Assembly => self.run_assembly_test(),
-            TestMode::RustdocJs => self.run_rustdoc_js_test(),
-            TestMode::CoverageMap => self.run_coverage_map_test(), // see self::coverage
-            TestMode::CoverageRun => self.run_coverage_run_test(), // see self::coverage
-            TestMode::Crashes => self.run_crash_test(),
+        // Run the test multiple times if requested.
+        // This is useful for catching flaky tests under the parallel frontend.
+        for _ in 0..self.config.iteration_count {
+            match self.config.mode {
+                TestMode::Pretty => self.run_pretty_test(),
+                TestMode::DebugInfo => self.run_debuginfo_test(),
+                TestMode::Codegen => self.run_codegen_test(),
+                TestMode::RustdocHtml => self.run_rustdoc_html_test(),
+                TestMode::RustdocJson => self.run_rustdoc_json_test(),
+                TestMode::CodegenUnits => self.run_codegen_units_test(),
+                TestMode::Incremental => self.run_incremental_test(),
+                TestMode::RunMake => self.run_rmake_test(),
+                TestMode::Ui => self.run_ui_test(),
+                TestMode::MirOpt => self.run_mir_opt_test(),
+                TestMode::Assembly => self.run_assembly_test(),
+                TestMode::RustdocJs => self.run_rustdoc_js_test(),
+                TestMode::CoverageMap => self.run_coverage_map_test(), // see self::coverage
+                TestMode::CoverageRun => self.run_coverage_run_test(), // see self::coverage
+                TestMode::Crashes => self.run_crash_test(),
+            }
         }
     }
 
@@ -297,14 +295,9 @@ impl<'test> TestCx<'test> {
 
     fn should_run(&self, pm: Option<PassMode>) -> WillExecute {
         let test_should_run = match self.config.mode {
-            TestMode::Ui
-                if pm == Some(PassMode::Run)
-                    || matches!(self.props.fail_mode, Some(FailMode::Run(_))) =>
-            {
-                true
+            TestMode::Ui => {
+                pm == Some(PassMode::Run) || matches!(self.props.fail_mode, Some(FailMode::Run(_)))
             }
-            TestMode::MirOpt if pm == Some(PassMode::Run) => true,
-            TestMode::Ui | TestMode::MirOpt => false,
             mode => panic!("unimplemented for mode {:?}", mode),
         };
         if test_should_run { self.run_if_enabled() } else { WillExecute::No }
@@ -316,7 +309,7 @@ impl<'test> TestCx<'test> {
 
     fn should_run_successfully(&self, pm: Option<PassMode>) -> bool {
         match self.config.mode {
-            TestMode::Ui | TestMode::MirOpt => pm == Some(PassMode::Run),
+            TestMode::Ui => pm == Some(PassMode::Run),
             mode => panic!("unimplemented for mode {:?}", mode),
         }
     }
@@ -330,14 +323,14 @@ impl<'test> TestCx<'test> {
                 let revision =
                     self.revision.expect("incremental tests require a list of revisions");
                 if revision.starts_with("cpass")
+                    || revision.starts_with("bpass")
                     || revision.starts_with("rpass")
-                    || revision.starts_with("rfail")
                 {
                     true
-                } else if revision.starts_with("cfail") {
-                    pm.is_some()
+                } else if revision.starts_with("bfail") {
+                    false
                 } else {
-                    panic!("revision name must begin with cpass, rpass, rfail, or cfail");
+                    panic!("revision name must begin with `cpass`, `bfail`, `bpass`, or `rpass`");
                 }
             }
             mode => panic!("unimplemented for mode {:?}", mode),
@@ -451,6 +444,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg(input)
             .args(&["-Z", &format!("unpretty={}", pretty_type)])
+            .arg("-Zunstable-options")
             .args(&["--target", &self.config.target])
             .arg("-L")
             .arg(&aux_dir)
@@ -504,12 +498,11 @@ impl<'test> TestCx<'test> {
             let normalized_revision = normalize_revision(revision);
             let cfg_arg = ["--cfg", &normalized_revision];
             let arg = format!("--cfg={normalized_revision}");
-            if self
-                .props
-                .compile_flags
-                .windows(2)
-                .any(|args| args == cfg_arg || args[0] == arg || args[1] == arg)
-            {
+            // Handle if compile_flags is length 1
+            let contains_arg =
+                self.props.compile_flags.iter().any(|considered_arg| *considered_arg == arg);
+            let contains_cfg_arg = self.props.compile_flags.windows(2).any(|args| args == cfg_arg);
+            if contains_arg || contains_cfg_arg {
                 error!(
                     "redundant cfg argument `{normalized_revision}` is already created by the \
                     revision"
@@ -557,6 +550,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg("-")
             .arg("-Zno-codegen")
+            .arg("-Zunstable-options")
             .arg("--out-dir")
             .arg(&out_dir)
             .arg(&format!("--target={}", target))
@@ -667,16 +661,6 @@ impl<'test> TestCx<'test> {
             } else {
                 missing_patterns.push(pattern.to_string());
             }
-        }
-    }
-
-    fn check_no_compiler_crash(&self, proc_res: &ProcRes, should_ice: bool) {
-        match proc_res.status.code() {
-            Some(101) if !should_ice => {
-                self.fatal_proc_rec("compiler encountered internal error", proc_res)
-            }
-            None => self.fatal_proc_rec("compiler terminated by signal", proc_res),
-            _ => (),
         }
     }
 
@@ -946,23 +930,13 @@ impl<'test> TestCx<'test> {
     }
 
     fn compile_test(&self, will_execute: WillExecute, emit: Emit) -> ProcRes {
-        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), Vec::new())
-    }
-
-    fn compile_test_with_passes(
-        &self,
-        will_execute: WillExecute,
-        emit: Emit,
-        passes: Vec<String>,
-    ) -> ProcRes {
-        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), passes)
+        self.compile_test_general(will_execute, emit, Vec::new())
     }
 
     fn compile_test_general(
         &self,
         will_execute: WillExecute,
         emit: Emit,
-        local_pm: Option<PassMode>,
         passes: Vec<String>,
     ) -> ProcRes {
         let compiler_kind = self.compiler_kind_for_non_aux();
@@ -986,13 +960,14 @@ impl<'test> TestCx<'test> {
                     // Note that we use the local pass mode here as we don't want
                     // to set unused to allow if we've overridden the pass mode
                     // via command line flags.
-                    && local_pm != Some(PassMode::Run)
+                    && self.props.local_pass_mode() != Some(PassMode::Run)
                 {
                     AllowUnused::Yes
                 } else {
                     AllowUnused::No
                 }
             }
+            TestMode::Incremental => AllowUnused::Yes,
             _ => AllowUnused::No,
         };
 
@@ -1753,6 +1728,14 @@ impl<'test> TestCx<'test> {
                 compiler.arg("-Zwrite-long-types-to-disk=no");
                 // FIXME: use this for other modes too, for perf?
                 compiler.arg("-Cstrip=debuginfo");
+
+                if self.config.parallel_frontend_enabled() {
+                    // Currently, we only use multiple threads for the UI test suite,
+                    // because UI tests can effectively verify the parallel frontend and
+                    // require minimal modification. The option will later be extended to
+                    // other test suites.
+                    compiler.arg(&format!("-Zthreads={}", self.config.parallel_frontend_threads));
+                }
             }
             TestMode::MirOpt => {
                 // We check passes under test to minimize the mir-opt test dump
@@ -1908,8 +1891,9 @@ impl<'test> TestCx<'test> {
             compiler.args(&["-A", "unused", "-W", "unused_attributes"]);
         }
 
-        // Allow tests to use internal features.
+        // Allow tests to use internal and incomplete features.
         compiler.args(&["-A", "internal_features"]);
+        compiler.args(&["-A", "incomplete_features"]);
 
         // Allow tests to have unused parens and braces.
         // Add #![deny(unused_parens, unused_braces)] to the test file if you want to
@@ -2110,7 +2094,7 @@ impl<'test> TestCx<'test> {
     }
 
     /// Prints a message to (captured) stdout if `config.verbose` is true.
-    /// The message is also logged to `tracing::debug!` regardles of verbosity.
+    /// The message is also logged to `tracing::debug!` regardless of verbosity.
     ///
     /// Use `format_args!` as the argument to perform formatting if required.
     fn logv(&self, message: impl fmt::Display) {
@@ -2719,28 +2703,40 @@ impl<'test> TestCx<'test> {
         // Wrapper tools set by `runner` might provide extra output on failure,
         // for example a WebAssembly runtime might print the stack trace of an
         // `unreachable` instruction by default.
-        //
+        let compare_output_by_lines_subset = self.config.runner.is_some();
+
         // Also, some tests like `ui/parallel-rustc` have non-deterministic
         // orders of output, so we need to compare by lines.
-        let compare_output_by_lines =
-            self.props.compare_output_by_lines || self.config.runner.is_some();
+        let compare_output_by_lines = self.props.compare_output_by_lines;
 
         let tmp;
-        let (expected, actual): (&str, &str) = if compare_output_by_lines {
+        let (expected, actual): (&str, &str) = if compare_output_by_lines_subset {
             let actual_lines: HashSet<_> = actual.lines().collect();
             let expected_lines: Vec<_> = expected.lines().collect();
             let mut used = expected_lines.clone();
             used.retain(|line| actual_lines.contains(line));
+
             // check if `expected` contains a subset of the lines of `actual`
             if used.len() == expected_lines.len() && (expected.is_empty() == actual.is_empty()) {
                 return CompareOutcome::Same;
             }
             if expected_lines.is_empty() {
-                // if we have no lines to check, force a full overwite
+                // if we have no lines to check, force a full overwrite
                 ("", actual)
             } else {
+                // this prints/blesses the subset, not the actual
                 tmp = (expected_lines.join("\n"), used.join("\n"));
                 (&tmp.0, &tmp.1)
+            }
+        } else if compare_output_by_lines {
+            let mut actual_lines: Vec<&str> = actual.lines().collect();
+            let mut expected_lines: Vec<&str> = expected.lines().collect();
+            actual_lines.sort_unstable();
+            expected_lines.sort_unstable();
+            if actual_lines == expected_lines {
+                return CompareOutcome::Same;
+            } else {
+                (expected, actual)
             }
         } else {
             (expected, actual)
@@ -2771,6 +2767,7 @@ impl<'test> TestCx<'test> {
                     expected,
                     actual,
                     actual_unnormalized,
+                    compare_output_by_lines || compare_output_by_lines_subset,
                 );
             }
         } else {
@@ -2808,6 +2805,7 @@ impl<'test> TestCx<'test> {
         expected: &str,
         actual: &str,
         actual_unnormalized: &str,
+        show_diff_by_lines: bool,
     ) {
         writeln!(self.stderr, "diff of {stream}:\n");
         if let Some(diff_command) = self.config.diff_command.as_deref() {
@@ -2873,6 +2871,10 @@ impl<'test> TestCx<'test> {
                 "{}",
                 write_diff(&mismatches_unnormalized, &mismatches_normalized, 0)
             );
+        }
+
+        if show_diff_by_lines {
+            write!(self.stderr, "{}", diff_by_lines(expected, actual));
         }
     }
 
@@ -2961,7 +2963,7 @@ struct ProcArgs {
 }
 
 #[derive(Debug)]
-pub struct ProcRes {
+pub(crate) struct ProcRes {
     status: ExitStatus,
     stdout: String,
     stderr: String,
@@ -2971,7 +2973,7 @@ pub struct ProcRes {
 
 impl ProcRes {
     #[must_use]
-    pub fn format_info(&self) -> String {
+    pub(crate) fn format_info(&self) -> String {
         fn render(name: &str, contents: &str) -> String {
             let contents = json::extract_rendered(contents);
             let contents = contents.trim_end();

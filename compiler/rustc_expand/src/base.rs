@@ -15,7 +15,7 @@ use rustc_data_structures::sync;
 use rustc_errors::{BufferedEarlyLint, DiagCtxtHandle, ErrorGuaranteed, PResult};
 use rustc_feature::Features;
 use rustc_hir as hir;
-use rustc_hir::attrs::{AttributeKind, CfgEntry, CollapseMacroDebuginfo, Deprecation};
+use rustc_hir::attrs::{CfgEntry, CollapseMacroDebuginfo, Deprecation};
 use rustc_hir::def::MacroKinds;
 use rustc_hir::limit::Limit;
 use rustc_hir::{Stability, find_attr};
@@ -149,14 +149,14 @@ impl Annotatable {
     pub fn expect_trait_item(self) -> Box<ast::AssocItem> {
         match self {
             Annotatable::AssocItem(i, AssocCtxt::Trait) => i,
-            _ => panic!("expected Item"),
+            _ => panic!("expected trait item"),
         }
     }
 
     pub fn expect_impl_item(self) -> Box<ast::AssocItem> {
         match self {
             Annotatable::AssocItem(i, AssocCtxt::Impl { .. }) => i,
-            _ => panic!("expected Item"),
+            _ => panic!("expected impl item"),
         }
     }
 
@@ -277,7 +277,8 @@ impl<'cx> MacroExpanderResult<'cx> {
         // Emit the SEMICOLON_IN_EXPRESSIONS_FROM_MACROS deprecation lint.
         let is_local = true;
 
-        let parser = ParserAnyMacro::from_tts(cx, tts, site_span, arm_span, is_local, macro_ident);
+        let parser =
+            ParserAnyMacro::from_tts(cx, tts, site_span, arm_span, is_local, macro_ident, &[], &[]);
         ExpandResult::Ready(Box::new(parser))
     }
 }
@@ -377,8 +378,8 @@ where
 
 /// Represents a thing that maps token trees to Macro Results
 pub trait TTMacroExpander: Any {
-    fn expand<'cx>(
-        &self,
+    fn expand<'cx, 'a: 'cx>(
+        &'a self,
         ecx: &'cx mut ExtCtxt<'_>,
         span: Span,
         input: TokenStream,
@@ -394,8 +395,8 @@ impl<F: 'static> TTMacroExpander for F
 where
     F: for<'cx> Fn(&'cx mut ExtCtxt<'_>, Span, TokenStream) -> MacroExpanderResult<'cx>,
 {
-    fn expand<'cx>(
-        &self,
+    fn expand<'cx, 'a: 'cx>(
+        &'a self,
         ecx: &'cx mut ExtCtxt<'_>,
         span: Span,
         input: TokenStream,
@@ -408,17 +409,10 @@ pub trait GlobDelegationExpander {
     fn expand(&self, ecx: &mut ExtCtxt<'_>) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()>;
 }
 
-// Use a macro because forwarding to a simple function has type system issues
-macro_rules! make_stmts_default {
-    ($me:expr) => {
-        $me.make_expr().map(|e| {
-            smallvec![ast::Stmt {
-                id: ast::DUMMY_NODE_ID,
-                span: e.span,
-                kind: ast::StmtKind::Expr(e),
-            }]
-        })
-    };
+fn make_stmts_default(expr: Option<Box<ast::Expr>>) -> Option<SmallVec<[ast::Stmt; 1]>> {
+    expr.map(|e| {
+        smallvec![ast::Stmt { id: ast::DUMMY_NODE_ID, span: e.span, kind: ast::StmtKind::Expr(e) }]
+    })
 }
 
 /// The result of a macro expansion. The return values of the various
@@ -464,7 +458,7 @@ pub trait MacResult {
     /// By default this attempts to create an expression statement,
     /// returning None if that fails.
     fn make_stmts(self: Box<Self>) -> Option<SmallVec<[ast::Stmt; 1]>> {
-        make_stmts_default!(self)
+        make_stmts_default(self.make_expr())
     }
 
     fn make_ty(self: Box<Self>) -> Option<Box<ast::Ty>> {
@@ -570,9 +564,10 @@ impl MacResult for MacEager {
     }
 
     fn make_stmts(self: Box<Self>) -> Option<SmallVec<[ast::Stmt; 1]>> {
-        match self.stmts.as_ref().map_or(0, |s| s.len()) {
-            0 => make_stmts_default!(self),
-            _ => self.stmts,
+        if self.stmts.as_ref().is_none_or(|s| s.is_empty()) {
+            make_stmts_default(self.make_expr())
+        } else {
+            self.stmts
         }
     }
 
@@ -896,14 +891,13 @@ impl SyntaxExtension {
     /// | yes           | yes | yes           | yes      | yes |
     fn get_collapse_debuginfo(sess: &Session, attrs: &[hir::Attribute], ext: bool) -> bool {
         let flag = sess.opts.cg.collapse_macro_debuginfo;
-        let attr =
-            if let Some(info) = find_attr!(attrs, AttributeKind::CollapseDebugInfo(info) => info) {
-                info.clone()
-            } else if find_attr!(attrs, AttributeKind::RustcBuiltinMacro { .. }) {
-                CollapseMacroDebuginfo::Yes
-            } else {
-                CollapseMacroDebuginfo::Unspecified
-            };
+        let attr = if let Some(info) = find_attr!(attrs, CollapseDebugInfo(info) => info) {
+            *info
+        } else if find_attr!(attrs, RustcBuiltinMacro { .. }) {
+            CollapseMacroDebuginfo::Yes
+        } else {
+            CollapseMacroDebuginfo::Unspecified
+        };
 
         #[rustfmt::skip]
         let collapse_table = [
@@ -918,7 +912,7 @@ impl SyntaxExtension {
     fn get_hide_backtrace(attrs: &[hir::Attribute]) -> bool {
         // FIXME(estebank): instead of reusing `#[rustc_diagnostic_item]` as a proxy, introduce a
         // new attribute purely for this under the `#[diagnostic]` namespace.
-        find_attr!(attrs, AttributeKind::RustcDiagnosticItem(..))
+        find_attr!(attrs, RustcDiagnosticItem(..))
     }
 
     /// Constructs a syntax extension with the given properties
@@ -933,19 +927,17 @@ impl SyntaxExtension {
         attrs: &[hir::Attribute],
         is_local: bool,
     ) -> SyntaxExtension {
-        let allow_internal_unstable =
-            find_attr!(attrs, AttributeKind::AllowInternalUnstable(i, _) => i)
-                .map(|i| i.as_slice())
-                .unwrap_or_default();
-        let allow_internal_unsafe = find_attr!(attrs, AttributeKind::AllowInternalUnsafe(_));
+        let allow_internal_unstable = find_attr!(attrs, AllowInternalUnstable(i, _) => i)
+            .map(|i| i.as_slice())
+            .unwrap_or_default();
+        let allow_internal_unsafe = find_attr!(attrs, AllowInternalUnsafe(_));
 
         let local_inner_macros =
-            *find_attr!(attrs, AttributeKind::MacroExport {local_inner_macros: l, ..} => l)
-                .unwrap_or(&false);
+            *find_attr!(attrs, MacroExport {local_inner_macros: l, ..} => l).unwrap_or(&false);
         let collapse_debuginfo = Self::get_collapse_debuginfo(sess, attrs, !is_local);
         tracing::debug!(?name, ?local_inner_macros, ?collapse_debuginfo, ?allow_internal_unsafe);
 
-        let (builtin_name, helper_attrs) = match find_attr!(attrs, AttributeKind::RustcBuiltinMacro { builtin_name, helper_attrs, .. } => (builtin_name, helper_attrs))
+        let (builtin_name, helper_attrs) = match find_attr!(attrs, RustcBuiltinMacro { builtin_name, helper_attrs, .. } => (builtin_name, helper_attrs))
         {
             // Override `helper_attrs` passed above if it's a built-in macro,
             // marking `proc_macro_derive` macros as built-in is not a realistic use case.
@@ -959,10 +951,9 @@ impl SyntaxExtension {
         };
         let hide_backtrace = builtin_name.is_some() || Self::get_hide_backtrace(attrs);
 
-        let stability = find_attr!(attrs, AttributeKind::Stability { stability, .. } => *stability);
+        let stability = find_attr!(attrs, Stability { stability, .. } => *stability);
 
-        if let Some(sp) = find_attr!(attrs, AttributeKind::RustcBodyStability{ span, .. } => *span)
-        {
+        if let Some(sp) = find_attr!(attrs, RustcBodyStability{ span, .. } => *span) {
             sess.dcx().emit_err(errors::MacroBodyStability {
                 span: sp,
                 head_span: sess.source_map().guess_head_span(span),
@@ -978,7 +969,7 @@ impl SyntaxExtension {
             stability,
             deprecation: find_attr!(
                 attrs,
-                AttributeKind::Deprecation { deprecation, .. } => *deprecation
+                Deprecated { deprecation, .. } => *deprecation
             ),
             helper_attrs,
             edition,
@@ -1022,18 +1013,24 @@ impl SyntaxExtension {
     pub fn glob_delegation(
         trait_def_id: DefId,
         impl_def_id: LocalDefId,
+        star_span: Span,
         edition: Edition,
     ) -> SyntaxExtension {
         struct GlobDelegationExpanderImpl {
             trait_def_id: DefId,
             impl_def_id: LocalDefId,
+            star_span: Span,
         }
         impl GlobDelegationExpander for GlobDelegationExpanderImpl {
             fn expand(
                 &self,
                 ecx: &mut ExtCtxt<'_>,
             ) -> ExpandResult<Vec<(Ident, Option<Ident>)>, ()> {
-                match ecx.resolver.glob_delegation_suffixes(self.trait_def_id, self.impl_def_id) {
+                match ecx.resolver.glob_delegation_suffixes(
+                    self.trait_def_id,
+                    self.impl_def_id,
+                    self.star_span,
+                ) {
                     Ok(suffixes) => ExpandResult::Ready(suffixes),
                     Err(Indeterminate) if ecx.force_mode => ExpandResult::Ready(Vec::new()),
                     Err(Indeterminate) => ExpandResult::Retry(()),
@@ -1041,7 +1038,7 @@ impl SyntaxExtension {
             }
         }
 
-        let expander = GlobDelegationExpanderImpl { trait_def_id, impl_def_id };
+        let expander = GlobDelegationExpanderImpl { trait_def_id, impl_def_id, star_span };
         SyntaxExtension::default(SyntaxExtensionKind::GlobDelegation(Arc::new(expander)), edition)
     }
 
@@ -1173,6 +1170,7 @@ pub trait ResolverExpand {
         &self,
         trait_def_id: DefId,
         impl_def_id: LocalDefId,
+        star_span: Span,
     ) -> Result<Vec<(Ident, Option<Ident>)>, Indeterminate>;
 
     /// Record the name of an opaque `Ty::ImplTrait` pre-expansion so that it can be used

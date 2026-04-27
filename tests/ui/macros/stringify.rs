@@ -9,12 +9,12 @@
 #![feature(const_trait_impl)]
 #![feature(coroutines)]
 #![feature(decl_macro)]
-#![feature(explicit_tail_calls)]
+#![feature(macro_guard_matcher)]
 #![feature(more_qualified_paths)]
 #![feature(never_patterns)]
+#![feature(specialization)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
-#![feature(type_ascription)]
 #![feature(yeet_expr)]
 #![deny(unused_macros)]
 
@@ -29,6 +29,7 @@ macro_rules! path { ($path:path) => { stringify!($path) }; }
 macro_rules! stmt { ($stmt:stmt) => { stringify!($stmt) }; }
 macro_rules! ty { ($ty:ty) => { stringify!($ty) }; }
 macro_rules! vis { ($vis:vis) => { stringify!($vis) }; }
+macro_rules! guard { ($guard:guard) => { stringify!($guard) }; }
 
 macro_rules! c1 {
     ($frag:ident, [$($tt:tt)*], $s:literal) => {
@@ -794,10 +795,130 @@ fn test_vis() {
     // Attributes are not allowed on visibilities.
 }
 
+#[test]
+fn test_guard() {
+    c1!(guard, [ if true ], "if true");
+    c1!(guard, [ if let Some(x) = Some(1) ], "if let Some(x) = Some(1)");
+    c1!(guard, [ if let Some(x) = Some(1) && x == 1 ], "if let Some(x) = Some(1) && x == 1");
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(1) = x ],
+        "if let Some(x) = Some(Some(1)) && let Some(1) = x"
+    );
+    c1!(guard,
+        [ if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1 ],
+        "if let Some(x) = Some(Some(1)) && let Some(y) = x && y == 1"
+    );
+}
+
 macro_rules! p {
     ([$($tt:tt)*], $s:literal) => {
         assert_eq!(stringify!($($tt)*), $s);
     };
+}
+
+#[test]
+fn test_impl_restriction() {
+    assert_eq!(
+        stringify!(pub impl(crate) trait Foo {}),
+        "pub impl(crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate) trait Foo {}),
+        "pub impl(in crate) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(super) trait Foo {}),
+        "pub impl(super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super) trait Foo {}),
+        "pub impl(in super) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(self) trait Foo {}),
+        "pub impl(self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self) trait Foo {}),
+        "pub impl(in self) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in path::to) trait Foo {}),
+        "pub impl(in path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in ::path::to) trait Foo {}),
+        "pub impl(in ::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in self::path::to) trait Foo {}),
+        "pub impl(in self::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in super::path::to) trait Foo {}),
+        "pub impl(in super::path::to) trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) trait Foo {}),
+        "pub impl(in crate::path::to) trait Foo {}"
+    );
+
+    assert_eq!(
+        stringify!(pub impl(crate) auto trait Foo {}),
+        "pub impl(crate) auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) auto trait Foo {}),
+        "pub impl(in crate::path::to) auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) unsafe trait Foo {}),
+        "pub impl(crate) unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) unsafe trait Foo {}),
+        "pub impl(in crate::path::to) unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const trait Foo {}),
+        "pub impl(crate) const trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const trait Foo {}),
+        "pub impl(in crate::path::to) const trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) unsafe auto trait Foo {}),
+        "pub impl(crate) unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) unsafe auto trait Foo {}),
+        "pub impl(in crate::path::to) unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const auto trait Foo {}),
+        "pub impl(crate) const auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const auto trait Foo {}),
+        "pub impl(in crate::path::to) const auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const unsafe trait Foo {}),
+        "pub impl(crate) const unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(in crate::path::to) const unsafe trait Foo {}),
+        "pub impl(in crate::path::to) const unsafe trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub impl(crate) const unsafe auto trait Foo {}),
+        "pub impl(crate) const unsafe auto trait Foo {}"
+    );
+    assert_eq!(
+        stringify!(pub const unsafe auto impl(in crate::path::to) trait Foo {}),
+        "pub const unsafe auto impl(in crate::path::to) trait Foo {}"
+    );
 }
 
 #[test]

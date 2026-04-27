@@ -31,6 +31,7 @@ mod inhabitedness;
 mod lower;
 pub mod next_solver;
 mod opaques;
+mod representability;
 mod specialization;
 mod target_feature;
 mod utils;
@@ -57,9 +58,12 @@ mod test_db;
 #[cfg(test)]
 mod tests;
 
-use std::hash::Hash;
+use std::{hash::Hash, ops::ControlFlow};
 
-use hir_def::{CallableDefId, TypeOrConstParamId, type_ref::Rawness};
+use hir_def::{
+    CallableDefId, ExpressionStoreOwnerId, GenericDefId, TypeAliasId, TypeOrConstParamId,
+    TypeParamId, resolver::TypeNs, type_ref::Rawness,
+};
 use hir_expand::name::Name;
 use indexmap::{IndexMap, map::Entry};
 use intern::{Symbol, sym};
@@ -77,24 +81,23 @@ use crate::{
     db::HirDatabase,
     display::{DisplayTarget, HirDisplay},
     infer::unify::InferenceTable,
+    lower::SupertraitsInfo,
     next_solver::{
         AliasTy, Binder, BoundConst, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, Canonical,
-        CanonicalVarKind, CanonicalVars, Const, ConstKind, DbInterner, FnSig, GenericArgs,
-        PolyFnSig, Predicate, Region, RegionKind, TraitRef, Ty, TyKind, Tys, abi,
+        CanonicalVarKind, CanonicalVarKinds, ClauseKind, Const, ConstKind, DbInterner, FnSig,
+        GenericArgs, PolyFnSig, Predicate, Region, RegionKind, TraitRef, Ty, TyKind, Tys, abi,
     },
 };
 
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, InferenceDiagnostic, InferenceResult,
-    InferenceTyDiagnosticSource, OverloadedDeref, PointerCast,
-    cast::CastError,
-    closure::analysis::{CaptureKind, CapturedItem},
-    could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
+    InferenceTyDiagnosticSource, OverloadedDeref, PointerCast, cast::CastError, could_coerce,
+    could_unify, could_unify_deeply, infer_query_with_inspect,
 };
 pub use lower::{
     GenericPredicates, ImplTraits, LifetimeElisionKind, TyDefId, TyLoweringContext, ValueTyDefId,
-    associated_type_shorthand_candidates, diagnostics::*,
+    diagnostics::*,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use target_feature::TargetFeatures;
@@ -103,6 +106,16 @@ pub use utils::{
     TargetFeatureIsSafeInTarget, Unsafety, all_super_traits, direct_super_traits,
     is_fn_unsafe_to_call, target_feature_is_safe_in_target,
 };
+
+pub mod closure_analysis {
+    pub use crate::infer::{
+        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, UpvarCapture,
+        closure::analysis::{
+            BorrowKind,
+            expr_use_visitor::{FakeReadCause, Place, PlaceBase, Projection, ProjectionKind},
+        },
+    };
+}
 
 /// A constant can have reference to other things. Memory map job is holding
 /// the necessary bits of memory of the const eval session to keep the constant
@@ -192,7 +205,7 @@ pub fn param_idx(db: &dyn HirDatabase, id: TypeOrConstParamId) -> Option<usize> 
     generics::generics(db, id.parent).type_or_const_param_idx(id)
 }
 
-#[derive(Debug, Copy, Clone, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum FnAbi {
     Aapcs,
     AapcsUnwind,
@@ -232,21 +245,6 @@ pub enum FnAbi {
     X86Interrupt,
     RustPreserveNone,
     Unknown,
-}
-
-impl PartialEq for FnAbi {
-    fn eq(&self, _other: &Self) -> bool {
-        // FIXME: Proper equality breaks `coercion::two_closures_lub` test
-        true
-    }
-}
-
-impl Hash for FnAbi {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        // Required because of the FIXME above and due to us implementing `Eq`, without this
-        // we would break the `Hash` + `Eq` contract
-        core::mem::discriminant(&Self::Unknown).hash(state);
-    }
 }
 
 impl FnAbi {
@@ -430,7 +428,7 @@ where
                 ConstKind::Error(_) => {
                     let var = rustc_type_ir::BoundVar::from_usize(self.vars.len());
                     self.vars.push(CanonicalVarKind::Const(rustc_type_ir::UniverseIndex::ZERO));
-                    Ok(Const::new_bound(self.interner, self.binder, BoundConst { var }))
+                    Ok(Const::new_bound(self.interner, self.binder, BoundConst::new(var)))
                 }
                 ConstKind::Infer(_) => error(),
                 ConstKind::Bound(BoundVarIndexKind::Bound(index), _) if index > self.binder => {
@@ -474,8 +472,54 @@ where
     Canonical {
         value,
         max_universe: rustc_type_ir::UniverseIndex::ZERO,
-        variables: CanonicalVars::new_from_slice(&error_replacer.vars),
+        var_kinds: CanonicalVarKinds::new_from_slice(&error_replacer.vars),
     }
+}
+
+/// To be used from `hir` only.
+pub fn associated_type_shorthand_candidates(
+    db: &dyn HirDatabase,
+    def: GenericDefId,
+    res: TypeNs,
+    mut cb: impl FnMut(&Name, TypeAliasId) -> bool,
+) -> Option<TypeAliasId> {
+    let interner = DbInterner::new_no_crate(db);
+    let (def, param) = match res {
+        TypeNs::GenericParam(param) => (def, param),
+        TypeNs::SelfType(impl_) => {
+            let impl_trait = db.impl_trait(impl_)?.skip_binder().def_id.0;
+            let param = TypeParamId::trait_self(impl_trait);
+            (impl_trait.into(), param)
+        }
+        _ => return None,
+    };
+
+    let mut dedup_map = FxHashSet::default();
+    let param_ty = Ty::new_param(interner, param, param_idx(db, param.into()).unwrap() as u32);
+    // We use the ParamEnv and not the predicates because the ParamEnv elaborates bounds.
+    let param_env = db.trait_environment(ExpressionStoreOwnerId::from(def));
+    for clause in param_env.clauses {
+        let ClauseKind::Trait(trait_clause) = clause.kind().skip_binder() else { continue };
+        if trait_clause.self_ty() != param_ty {
+            continue;
+        }
+        let trait_id = trait_clause.def_id().0;
+        dedup_map.extend(
+            SupertraitsInfo::query(db, trait_id)
+                .defined_assoc_types
+                .iter()
+                .map(|(name, id)| (name, *id)),
+        );
+    }
+
+    dedup_map
+        .into_iter()
+        .try_for_each(
+            |(name, id)| {
+                if cb(name, id) { ControlFlow::Break(id) } else { ControlFlow::Continue(()) }
+            },
+        )
+        .break_value()
 }
 
 /// To be used from `hir` only.
@@ -500,8 +544,11 @@ pub fn callable_sig_from_fn_trait<'db>(
     let trait_ref = TraitRef::new_from_args(table.interner(), fn_once_trait.into(), args);
     let projection = Ty::new_alias(
         table.interner(),
-        rustc_type_ir::AliasTyKind::Projection,
-        AliasTy::new_from_args(table.interner(), output_assoc_type.into(), args),
+        AliasTy::new_from_args(
+            table.interner(),
+            rustc_type_ir::Projection { def_id: output_assoc_type.into() },
+            args,
+        ),
     );
 
     let pred = Predicate::upcast_from(trait_ref, table.interner());

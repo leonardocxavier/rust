@@ -9,7 +9,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, Ty};
-use rustc_span::source_map::Spanned;
+use rustc_span::Spanned;
 
 use super::MANUAL_DIV_CEIL;
 
@@ -73,14 +73,13 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, op: BinOpKind, lhs: &
                     build_suggestion(cx, expr, inner_lhs, rhs, &mut applicability);
                 }
             },
-            ExprKind::MethodCall(method, receiver, [next_multiple_of_arg], _) => {
-                // x.next_multiple_of(Y) / Y
+            ExprKind::MethodCall(method, receiver, [next_multiple_of_arg], _)
                 if method.ident.name == sym::next_multiple_of
                     && check_int_ty(cx.typeck_results().expr_ty(receiver))
-                    && check_eq_expr(cx, next_multiple_of_arg, rhs)
-                {
-                    build_suggestion(cx, expr, receiver, rhs, &mut applicability);
-                }
+                    && check_eq_expr(cx, next_multiple_of_arg, rhs) =>
+            {
+                // x.next_multiple_of(Y) / Y
+                build_suggestion(cx, expr, receiver, rhs, &mut applicability);
             },
             ExprKind::Call(callee, [receiver, next_multiple_of_arg]) => {
                 // int_type::next_multiple_of(x, Y) / Y
@@ -149,7 +148,8 @@ fn build_suggestion(
     rhs: &Expr<'_>,
     applicability: &mut Applicability,
 ) {
-    let dividend_sugg = Sugg::hir_with_applicability(cx, lhs, "..", applicability).maybe_paren();
+    let ctxt = expr.span.ctxt();
+    let dividend_sugg = Sugg::hir_with_context(cx, lhs, ctxt, "..", applicability).maybe_paren();
     let rhs_ty = cx.typeck_results().expr_ty(rhs);
     let type_suffix = if cx.typeck_results().expr_ty(lhs).is_numeric()
         && matches!(
@@ -187,7 +187,7 @@ fn build_suggestion(
     };
 
     // Dereference the RHS if it is a reference type
-    let divisor_snippet = match Sugg::hir_with_context(cx, rhs, expr.span.ctxt(), "_", applicability) {
+    let divisor_snippet = match Sugg::hir_with_context(cx, rhs, ctxt, "_", applicability) {
         sugg if rhs_ty.is_ref() => sugg.deref(),
         sugg => sugg,
     };

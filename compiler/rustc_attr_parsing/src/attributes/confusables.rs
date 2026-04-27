@@ -12,10 +12,7 @@ impl<S: Stage> AttributeParser<S> for ConfusablesParser {
         &[sym::rustc_confusables],
         template!(List: &[r#""name1", "name2", ..."#]),
         |this, cx, args| {
-            let Some(list) = args.list() else {
-                cx.expected_list(cx.attr_span, args);
-                return;
-            };
+            let Some(list) = cx.expect_list(args, cx.attr_span) else { return };
 
             if list.is_empty() {
                 cx.emit_err(EmptyConfusables { span: cx.attr_span });
@@ -25,7 +22,7 @@ impl<S: Stage> AttributeParser<S> for ConfusablesParser {
                 let span = param.span();
 
                 let Some(lit) = param.lit().and_then(|i| i.value_str()) else {
-                    cx.expected_string_literal(span, param.lit());
+                    cx.adcx().expected_string_literal(span, param.lit());
                     continue;
                 };
 
@@ -43,9 +40,6 @@ impl<S: Stage> AttributeParser<S> for ConfusablesParser {
             return None;
         }
 
-        Some(AttributeKind::RustcConfusables {
-            symbols: self.confusables,
-            first_span: self.first_span.unwrap(),
-        })
+        Some(AttributeKind::RustcConfusables { confusables: self.confusables })
     }
 }

@@ -1,6 +1,6 @@
-use rustc_errors::MultiSpan;
 use rustc_errors::codes::*;
-use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, MultiSpan};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::{GenericArg, Ty};
 use rustc_span::Span;
 
@@ -47,7 +47,7 @@ pub(crate) struct GenericDoesNotLiveLongEnough {
     pub span: Span,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("variable does not need to be mutable")]
 pub(crate) struct VarNeedNotMut {
     #[suggestion(
@@ -456,7 +456,18 @@ pub(crate) enum CaptureReasonLabel<'a> {
         is_move_msg: bool,
         is_loop_message: bool,
     },
-    #[label("help: consider calling `.as_ref()` or `.as_mut()` to borrow the type's contents")]
+    #[suggestion(
+        "consider calling `.as_ref()` to borrow the value's contents",
+        applicability = "maybe-incorrect",
+        code = ".as_ref()",
+        style = "verbose"
+    )]
+    #[suggestion(
+        "consider calling `.as_mut()` to mutably borrow the value's contents",
+        applicability = "maybe-incorrect",
+        code = ".as_mut()",
+        style = "verbose"
+    )]
     BorrowContent {
         #[primary_span]
         var_span: Span,
@@ -570,6 +581,16 @@ pub(crate) enum TypeNoCopy<'a, 'tcx> {
         #[primary_span]
         span: Span,
     },
+    #[label(
+        "data moved here because {$place} has type `{$ty}`, which does not implement the `Copy` \
+         trait"
+    )]
+    LabelMovedHere {
+        ty: Ty<'tcx>,
+        place: &'a str,
+        #[primary_span]
+        span: Span,
+    },
     #[note(
         "{$is_partial_move ->
             [true] partial move
@@ -595,9 +616,20 @@ pub(crate) struct SimdIntrinsicArgConst {
     pub intrinsic: String,
 }
 
-#[derive(LintDiagnostic)]
-#[diag("relative drop order changing in Rust 2024")]
-pub(crate) struct TailExprDropOrder {
-    #[label("this temporary value will be dropped at the end of the block")]
+pub(crate) struct TailExprDropOrder<F: FnOnce(&mut Diag<'_, ()>)> {
     pub borrowed: Span,
+    pub callback: F,
+}
+
+impl<'a, F: FnOnce(&mut Diag<'_, ()>)> Diagnostic<'a, ()> for TailExprDropOrder<F> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
+        let Self { borrowed, callback } = self;
+        let mut diag = Diag::new(dcx, level, "relative drop order changing in Rust 2024")
+            .with_span_label(
+                borrowed,
+                "this temporary value will be dropped at the end of the block",
+            );
+        callback(&mut diag);
+        diag
+    }
 }

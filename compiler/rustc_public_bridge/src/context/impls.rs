@@ -18,7 +18,7 @@ use rustc_middle::ty::{
     AdtDef, AdtKind, AssocItem, Binder, ClosureKind, CoroutineArgsExt, EarlyBinder,
     ExistentialTraitRef, FnSig, GenericArgsRef, Instance, InstanceKind, IntrinsicDef, List,
     PolyFnSig, ScalarInt, TraitDef, TraitRef, Ty, TyCtxt, TyKind, TypeVisitableExt, UintTy,
-    ValTree, VariantDef,
+    ValTree, VariantDef, VtblEntry,
 };
 use rustc_middle::{mir, ty};
 use rustc_session::cstore::ForeignModule;
@@ -379,8 +379,18 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         def_id: DefId,
         args_ref: GenericArgsRef<'tcx>,
     ) -> Binder<'tcx, FnSig<'tcx>> {
-        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args_ref);
+        let sig = self.tcx.fn_sig(def_id).instantiate(self.tcx, args_ref).skip_norm_wip();
         sig
+    }
+
+    /// Retrieve the constness for the given function definition.
+    pub fn constness(&self, def_id: DefId) -> rustc_hir::Constness {
+        self.tcx.constness(def_id)
+    }
+
+    /// Retrieve the asyncness for the given function definition.
+    pub fn asyncness(&self, def_id: DefId) -> ty::Asyncness {
+        self.tcx.asyncness(def_id)
     }
 
     /// Retrieve the intrinsic definition if the item corresponds one.
@@ -541,7 +551,7 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
 
     /// Returns the type of given crate item.
     pub fn def_ty(&self, item: DefId) -> Ty<'tcx> {
-        self.tcx.type_of(item).instantiate_identity()
+        self.tcx.type_of(item).instantiate_identity().skip_norm_wip()
     }
 
     /// Returns the type of given definition instantiated with the given arguments.
@@ -554,8 +564,8 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
         )
     }
 
-    /// `Span` of an item.
-    pub fn span_of_an_item(&self, def_id: DefId) -> Span {
+    /// `Span` of a `DefId`.
+    pub fn span_of_a_def(&self, def_id: DefId) -> Span {
         self.tcx.def_span(def_id)
     }
 
@@ -756,5 +766,17 @@ impl<'tcx, B: Bridge> CompilerCtxt<'tcx, B> {
                 .collect()
         };
         assoc_items
+    }
+
+    /// Get all vtable entries of a trait.
+    pub fn vtable_entries(&self, trait_ref: TraitRef<'tcx>) -> Vec<VtblEntry<'tcx>> {
+        self.tcx.vtable_entries(trait_ref).to_vec()
+    }
+
+    /// Returns the vtable entry at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn vtable_entry(&self, trait_ref: TraitRef<'tcx>, idx: usize) -> Option<VtblEntry<'tcx>> {
+        self.vtable_entries(trait_ref).get(idx).copied()
     }
 }

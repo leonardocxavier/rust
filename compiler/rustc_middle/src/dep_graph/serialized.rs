@@ -43,7 +43,7 @@ use std::cell::RefCell;
 use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::{iter, mem, u64};
+use std::{iter, mem};
 
 use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
 use rustc_data_structures::fx::FxHashMap;
@@ -58,8 +58,8 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::Session;
 use tracing::{debug, instrument};
 
-use super::graph::{CurrentDepGraph, DepNodeColorMap};
-use super::query::DepGraphQuery;
+use super::graph::{CurrentDepGraph, DepNodeColorMap, DesiredColor, TrySetColorResult};
+use super::retained::RetainedDepGraph;
 use super::{DepKind, DepNode, DepNodeIndex};
 use crate::dep_graph::edges::EdgesVec;
 
@@ -70,6 +70,15 @@ rustc_index::newtype_index! {
     #[encodable]
     #[max = 0x7FFF_FFFF]
     pub struct SerializedDepNodeIndex {}
+}
+
+impl SerializedDepNodeIndex {
+    /// Converts a current-session dep node index to a "serialized" index,
+    /// for the purpose of serializing data to be loaded by future sessions.
+    #[inline(always)]
+    pub fn from_curr_for_serialization(index: DepNodeIndex) -> Self {
+        SerializedDepNodeIndex::from_u32(index.as_u32())
+    }
 }
 
 const DEP_NODE_SIZE: usize = size_of::<SerializedDepNodeIndex>();
@@ -615,21 +624,21 @@ impl EncoderState {
         index: DepNodeIndex,
         edge_count: usize,
         edges: impl FnOnce(&Self) -> Vec<DepNodeIndex>,
-        record_graph: &Option<Lock<DepGraphQuery>>,
+        retained_graph: &Option<Lock<RetainedDepGraph>>,
         local: &mut LocalEncoderState,
     ) {
         local.kind_stats[node.kind.as_usize()] += 1;
         local.edge_count += edge_count;
 
-        if let Some(record_graph) = &record_graph {
+        if let Some(retained_graph) = &retained_graph {
             // Call `edges` before the outlined code to allow the closure to be optimized out.
             let edges = edges(self);
 
             // Outline the build of the full dep graph as it's typically disabled and cold.
             outline(move || {
                 // Do not ICE when a query is called from within `with_query`.
-                if let Some(record_graph) = &mut record_graph.try_lock() {
-                    record_graph.push(index, *node, &edges);
+                if let Some(retained_graph) = &mut retained_graph.try_lock() {
+                    retained_graph.push(index, *node, &edges);
                 }
             });
         }
@@ -662,7 +671,7 @@ impl EncoderState {
         &self,
         index: DepNodeIndex,
         node: &NodeInfo,
-        record_graph: &Option<Lock<DepGraphQuery>>,
+        retained_graph: &Option<Lock<RetainedDepGraph>>,
         local: &mut LocalEncoderState,
     ) {
         node.encode(&mut local.encoder, index);
@@ -672,7 +681,7 @@ impl EncoderState {
             index,
             node.edges.len(),
             |_| node.edges[..].to_vec(),
-            record_graph,
+            retained_graph,
             &mut *local,
         );
     }
@@ -688,7 +697,7 @@ impl EncoderState {
         &self,
         index: DepNodeIndex,
         prev_index: SerializedDepNodeIndex,
-        record_graph: &Option<Lock<DepGraphQuery>>,
+        retained_graph: &Option<Lock<RetainedDepGraph>>,
         colors: &DepNodeColorMap,
         local: &mut LocalEncoderState,
     ) {
@@ -714,7 +723,7 @@ impl EncoderState {
                     .map(|i| colors.current(i).unwrap())
                     .collect()
             },
-            record_graph,
+            retained_graph,
             &mut *local,
         );
     }
@@ -845,7 +854,8 @@ impl EncoderState {
 pub(crate) struct GraphEncoder {
     profiler: SelfProfilerRef,
     status: EncoderState,
-    record_graph: Option<Lock<DepGraphQuery>>,
+    /// In-memory copy of the dep graph; only present if `-Zquery-dep-graph` is set.
+    retained_graph: Option<Lock<RetainedDepGraph>>,
 }
 
 impl GraphEncoder {
@@ -855,18 +865,18 @@ impl GraphEncoder {
         prev_node_count: usize,
         previous: Arc<SerializedDepGraph>,
     ) -> Self {
-        let record_graph = sess
+        let retained_graph = sess
             .opts
             .unstable_opts
             .query_dep_graph
-            .then(|| Lock::new(DepGraphQuery::new(prev_node_count)));
+            .then(|| Lock::new(RetainedDepGraph::new(prev_node_count)));
         let status = EncoderState::new(encoder, sess.opts.unstable_opts.incremental_info, previous);
-        GraphEncoder { status, record_graph, profiler: sess.prof.clone() }
+        GraphEncoder { status, retained_graph, profiler: sess.prof.clone() }
     }
 
-    pub(crate) fn with_query(&self, f: impl Fn(&DepGraphQuery)) {
-        if let Some(record_graph) = &self.record_graph {
-            f(&record_graph.lock())
+    pub(crate) fn with_retained_dep_graph(&self, f: impl Fn(&RetainedDepGraph)) {
+        if let Some(retained_graph) = &self.retained_graph {
+            f(&retained_graph.lock())
         }
     }
 
@@ -882,7 +892,7 @@ impl GraphEncoder {
         let mut local = self.status.local.borrow_mut();
         let index = self.status.next_index(&mut *local);
         self.status.bump_index(&mut *local);
-        self.status.encode_node(index, &node, &self.record_graph, &mut *local);
+        self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
         index
     }
 
@@ -904,17 +914,18 @@ impl GraphEncoder {
         let mut local = self.status.local.borrow_mut();
 
         let index = self.status.next_index(&mut *local);
+        let color = if is_green { DesiredColor::Green { index } } else { DesiredColor::Red };
 
-        // Use `try_mark` to avoid racing when `send_promoted` is called concurrently
+        // Use `try_set_color` to avoid racing when `send_promoted` is called concurrently
         // on the same index.
-        match colors.try_mark(prev_index, index, is_green) {
-            Ok(()) => (),
-            Err(None) => panic!("dep node {:?} is unexpectedly red", prev_index),
-            Err(Some(dep_node_index)) => return dep_node_index,
+        match colors.try_set_color(prev_index, color) {
+            TrySetColorResult::Success => {}
+            TrySetColorResult::AlreadyRed => panic!("dep node {prev_index:?} is unexpectedly red"),
+            TrySetColorResult::AlreadyGreen { index } => return index,
         }
 
         self.status.bump_index(&mut *local);
-        self.status.encode_node(index, &node, &self.record_graph, &mut *local);
+        self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
         index
     }
 
@@ -922,7 +933,8 @@ impl GraphEncoder {
     /// from the previous dep graph and expects all edges to already have a new dep node index
     /// assigned.
     ///
-    /// This will also ensure the dep node is marked green if `Some` is returned.
+    /// Tries to mark the dep node green, and returns Some if it is now green,
+    /// or None if had already been concurrently marked red.
     #[inline]
     pub(crate) fn send_promoted(
         &self,
@@ -934,21 +946,22 @@ impl GraphEncoder {
         let mut local = self.status.local.borrow_mut();
         let index = self.status.next_index(&mut *local);
 
-        // Use `try_mark_green` to avoid racing when `send_promoted` or `send_and_color`
+        // Use `try_set_color` to avoid racing when `send_promoted` or `send_and_color`
         // is called concurrently on the same index.
-        match colors.try_mark(prev_index, index, true) {
-            Ok(()) => {
+        match colors.try_set_color(prev_index, DesiredColor::Green { index }) {
+            TrySetColorResult::Success => {
                 self.status.bump_index(&mut *local);
                 self.status.encode_promoted_node(
                     index,
                     prev_index,
-                    &self.record_graph,
+                    &self.retained_graph,
                     colors,
                     &mut *local,
                 );
                 Some(index)
             }
-            Err(dep_node_index) => dep_node_index,
+            TrySetColorResult::AlreadyRed => None,
+            TrySetColorResult::AlreadyGreen { index } => Some(index),
         }
     }
 

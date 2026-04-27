@@ -1,6 +1,6 @@
 from __future__ import annotations
 import sys
-from typing import Generator, List, TYPE_CHECKING
+from typing import Generator, List, TYPE_CHECKING, Optional
 
 from lldb import (
     SBData,
@@ -9,6 +9,7 @@ from lldb import (
     eBasicTypeUnsignedLong,
     eBasicTypeUnsignedChar,
     eFormatChar,
+    eTypeIsInteger,
 )
 
 from rust_types import is_tuple_fields
@@ -90,11 +91,18 @@ def unwrap_unique_or_non_null(unique_or_nonnull: SBValue) -> SBValue:
     return ptr if ptr.TypeIsPointerType() else ptr.GetChildAtIndex(0)
 
 
+def unwrap_scalar_wrappers(wrapper: SBValue) -> SBValue:
+    while (wrapper.type.GetTypeFlags() & eTypeIsInteger) == 0:
+        wrapper = wrapper.GetChildAtIndex(0)
+    return wrapper
+
+
 class DefaultSyntheticProvider:
     def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
         # logger = Logger.Logger()
         # logger >> "Default synthetic provider for " + str(valobj.GetName())
         self.valobj = valobj
+        self.is_ptr = valobj.GetType().IsPointerType()
 
     def num_children(self) -> int:
         return self.valobj.GetNumChildren()
@@ -102,7 +110,7 @@ class DefaultSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.valobj.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.valobj.GetChildAtIndex(index)
 
     def update(self):
@@ -110,6 +118,40 @@ class DefaultSyntheticProvider:
 
     def has_children(self) -> bool:
         return self.valobj.MightHaveChildren()
+
+    def get_value(self):
+        return self.valobj.value
+
+
+class IndirectionSyntheticProvider:
+    def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
+        self.valobj = valobj
+
+    def num_children(self) -> int:
+        return 1
+
+    def get_child_index(self, name: str) -> int:
+        if name == "$$dereference$$":
+            return 0
+        return -1
+
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
+        if index == 0:
+            value = self.valobj.Dereference()
+            if (synth := value.GetSyntheticValue()).IsValid():
+                return synth
+            else:
+                return value
+        return None
+
+    def update(self):
+        pass
+
+    def has_children(self) -> bool:
+        return True
+
+    def get_value(self):
+        return self.valobj.value
 
 
 class EmptySyntheticProvider:
@@ -124,7 +166,7 @@ class EmptySyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return None
 
     def update(self):
@@ -193,8 +235,6 @@ def resolve_msvc_template_arg(arg_name: str, target: SBTarget) -> SBType:
             return result.GetPointerType()
 
     if arg_name.startswith("array$<"):
-        arg_name = arg_name[7:-1].strip()
-
         template_args = get_template_args(arg_name)
 
         element_name = next(template_args)
@@ -228,7 +268,7 @@ def aggregate_field_summary(valobj: SBValue, _dict) -> Generator[str, None, None
         if summary is None:
             summary = child.value
             if summary is None:
-                if is_tuple_fields(child):
+                if is_tuple_fields(child.GetType().fields):
                     summary = TupleSummaryProvider(child, _dict)
                 else:
                     summary = StructSummaryProvider(child, _dict)
@@ -249,7 +289,7 @@ def vec_to_string(vec: SBValue) -> str:
     )
 
 
-def StdStringSummaryProvider(valobj, dict):
+def StdStringSummaryProvider(valobj: SBValue, dict: LLDBOpaque):
     inner_vec = (
         valobj.GetNonSyntheticValue()
         .GetChildMemberWithName("vec")
@@ -385,7 +425,7 @@ class StructSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.fields.get(name, -1)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if self.is_variant:
             field = self.type.GetFieldAtIndex(index + 1)
         else:
@@ -430,7 +470,7 @@ class StdStringSyntheticProvider:
 
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if not 0 <= index < self.length:
             return None
         start = self.data_ptr.GetValueAsUnsigned()
@@ -466,7 +506,7 @@ class MSVCStrSyntheticProvider:
 
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if not 0 <= index < self.length:
             return None
         start = self.data_ptr.GetValueAsUnsigned()
@@ -522,7 +562,7 @@ class ClangEncodedEnumProvider:
     def get_child_index(self, name: str) -> int:
         return self.value.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.value.GetChildAtIndex(index)
 
     def update(self):
@@ -531,7 +571,9 @@ class ClangEncodedEnumProvider:
         self.variant = all_variants.GetChildAtIndex(index)
         self.value = self.variant.GetChildMemberWithName(
             ClangEncodedEnumProvider.VALUE_MEMBER_NAME
-        ).GetSyntheticValue()
+        )
+        if (synth := self.value.GetSyntheticValue()).IsValid():
+            self.value = synth
 
     def _getCurrentVariantIndex(self, all_variants: SBValue) -> int:
         default_index = 0
@@ -613,9 +655,10 @@ class MSVCEnumSyntheticProvider:
                     ).GetValueAsUnsigned()
                     if tag == discr:
                         self.variant = child
-                        self.value = child.GetChildMemberWithName(
-                            "value"
-                        ).GetSyntheticValue()
+                        self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
+
                         return
                 else:  # if invalid, DISCR must be a range
                     begin: int = (
@@ -633,16 +676,18 @@ class MSVCEnumSyntheticProvider:
                     if begin < end:
                         if begin <= tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                            if (synth := self.value.GetSyntheticValue()).IsValid():
+                                self.value = synth
+
                             return
                     else:
                         if tag >= begin or tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                            if (synth := self.value.GetSyntheticValue()).IsValid():
+                                self.value = synth
+
                             return
         else:  # if invalid, tag is a 128 bit value
             tag_lo: int = self.valobj.GetChildMemberWithName(
@@ -676,9 +721,9 @@ class MSVCEnumSyntheticProvider:
                     discr: int = (exact_hi << 64) | exact_lo
                     if tag == discr:
                         self.variant = child
-                        self.value = child.GetChildMemberWithName(
-                            "value"
-                        ).GetSyntheticValue()
+                        self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                         return
                 else:  # if invalid, DISCR must be a range
                     begin_lo: int = (
@@ -710,16 +755,16 @@ class MSVCEnumSyntheticProvider:
                     if begin < end:
                         if begin <= tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                             return
                     else:
                         if tag >= begin or tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                             return
 
     def num_children(self) -> int:
@@ -728,7 +773,7 @@ class MSVCEnumSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.value.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.value.GetChildAtIndex(index)
 
     def has_children(self) -> bool:
@@ -818,7 +863,7 @@ class TupleSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if self.is_variant:
             field = self.type.GetFieldAtIndex(index + 1)
         else:
@@ -847,7 +892,7 @@ class MSVCTupleSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.valobj.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         child: SBValue = self.valobj.GetChildAtIndex(index)
         offset = self.valobj.GetType().GetFieldAtIndex(index).byte_offset
         return self.valobj.CreateChildAtOffset(str(index), offset, child.GetType())
@@ -895,7 +940,7 @@ class StdVecSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + index * self.element_type_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -943,7 +988,7 @@ class StdSliceSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + index * self.element_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -1007,7 +1052,7 @@ class StdVecDequeSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + ((index + self.head) % self.cap) * self.element_type_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -1066,7 +1111,7 @@ class StdOldHashMapSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         # logger = Logger.Logger()
         start = self.data_ptr.GetValueAsUnsigned() & ~1
 
@@ -1155,7 +1200,7 @@ class StdHashMapSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         pairs_start = self.data_ptr.GetValueAsUnsigned()
         idx = self.valid_indices[index]
         if self.new_layout:
@@ -1246,12 +1291,9 @@ class StdRcSyntheticProvider:
     rust 1.33.0: struct NonNull<T> { pointer: *const T }
     struct NonZero<T>(T)
     struct RcInner<T> { strong: Cell<usize>, weak: Cell<usize>, value: T }
-    struct Cell<T> { value: UnsafeCell<T> }
-    struct UnsafeCell<T> { value: T }
 
     struct Arc<T> { ptr: NonNull<ArcInner<T>>, ... }
-    struct ArcInner<T> { strong: atomic::AtomicUsize, weak: atomic::AtomicUsize, data: T }
-    struct AtomicUsize { v: UnsafeCell<usize> }
+    struct ArcInner<T> { strong: atomic::Atomic<usize>, weak: atomic::Atomic<usize>, data: T }
     """
 
     def __init__(self, valobj: SBValue, _dict: LLDBOpaque, is_atomic: bool = False):
@@ -1261,16 +1303,8 @@ class StdRcSyntheticProvider:
 
         self.value = self.ptr.GetChildMemberWithName("data" if is_atomic else "value")
 
-        self.strong = (
-            self.ptr.GetChildMemberWithName("strong")
-            .GetChildAtIndex(0)
-            .GetChildMemberWithName("value")
-        )
-        self.weak = (
-            self.ptr.GetChildMemberWithName("weak")
-            .GetChildAtIndex(0)
-            .GetChildMemberWithName("value")
-        )
+        self.strong = unwrap_scalar_wrappers(self.ptr.GetChildMemberWithName("strong"))
+        self.weak = unwrap_scalar_wrappers(self.ptr.GetChildMemberWithName("weak"))
 
         self.value_builder = ValueBuilder(valobj)
 
@@ -1289,7 +1323,7 @@ class StdRcSyntheticProvider:
             return 2
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         if index == 1:
@@ -1322,7 +1356,7 @@ class StdCellSyntheticProvider:
             return 0
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         return None
@@ -1377,7 +1411,7 @@ class StdRefSyntheticProvider:
             return 1
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         if index == 1:

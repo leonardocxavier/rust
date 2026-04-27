@@ -49,7 +49,7 @@ const BASE_FN: &[&str] = &[
     label_strs::type_of,
     // And a big part of compilation (that we eventually want to cache) is type inference
     // information:
-    label_strs::typeck,
+    label_strs::typeck_root,
 ];
 
 /// DepNodes for Hir, which is pretty much everything
@@ -352,13 +352,11 @@ impl<'tcx> CleanVisitor<'tcx> {
         let item_span = self.tcx.def_span(item_id.to_def_id());
         let def_path_hash = self.tcx.def_path_hash(item_id.to_def_id());
 
-        let Some(attr) =
-            find_attr!(self.tcx.get_all_attrs(item_id), AttributeKind::RustcClean(attr) => attr)
-        else {
+        let Some(clean_attrs) = find_attr!(self.tcx, item_id, RustcClean(attr) => attr) else {
             return;
         };
 
-        for attr in attr {
+        for attr in clean_attrs {
             let Some(assertion) = self.assertion_maybe(item_id, attr) else {
                 continue;
             };

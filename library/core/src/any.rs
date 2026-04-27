@@ -86,7 +86,10 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::{fmt, hash, intrinsics, ptr};
+use crate::intrinsics::{self, type_id_vtable};
+use crate::mem::transmute;
+use crate::mem::type_info::{TraitImpl, TypeKind};
+use crate::{fmt, hash, ptr};
 
 ///////////////////////////////////////////////////////////////////////////////
 // Any trait
@@ -663,7 +666,7 @@ impl dyn Any + Send + Sync {
 ///
 /// The following is an example program that tries to use `TypeId::of` to
 /// implement a generic type `Unique<T>` that guarantees unique instances for each `Unique<T>`,
-/// that is, and for each type `T` there can be at most one value of type `Unique<T>` at any time.
+/// that is, for each type `T` there can be at most one value of type `Unique<T>` at any time.
 ///
 /// ```
 /// mod unique {
@@ -786,6 +789,67 @@ impl TypeId {
     #[rustc_const_stable(feature = "const_type_id", since = "1.91.0")]
     pub const fn of<T: ?Sized + 'static>() -> TypeId {
         const { intrinsics::type_id::<T>() }
+    }
+
+    /// Checks if the [TypeId] implements the trait. If it does it returns [TraitImpl] which can be used to build a fat pointer.
+    /// It can only be called at compile time. `self` must be the [TypeId] of a sized type or None will be returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::{TypeId};
+    ///
+    /// pub trait Blah {}
+    /// impl Blah for u8 {}
+    ///
+    /// assert!(const { TypeId::of::<u8>().trait_info_of::<dyn Blah>() }.is_some());
+    /// assert!(const { TypeId::of::<u16>().trait_info_of::<dyn Blah>() }.is_none());
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    pub const fn trait_info_of<
+        T: ptr::Pointee<Metadata = ptr::DynMetadata<T>> + ?Sized + 'static,
+    >(
+        self,
+    ) -> Option<TraitImpl<T>> {
+        // SAFETY: The vtable was obtained for `T`, so it is guaranteed to be `DynMetadata<T>`.
+        // The intrinsic can't infer this because it is designed to work with arbitrary TypeIds.
+        unsafe { transmute(self.trait_info_of_trait_type_id(const { TypeId::of::<T>() })) }
+    }
+
+    /// Checks if the [TypeId] implements the trait of `trait_represented_by_type_id`. If it does it returns [TraitImpl] which can be used to build a fat pointer.
+    /// It can only be called at compile time. `self` must be the [TypeId] of a sized type or None will be returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(type_info)]
+    /// use std::any::{TypeId};
+    ///
+    /// pub trait Blah {}
+    /// impl Blah for u8 {}
+    ///
+    /// assert!(const { TypeId::of::<u8>().trait_info_of_trait_type_id(TypeId::of::<dyn Blah>()) }.is_some());
+    /// assert!(const { TypeId::of::<u16>().trait_info_of_trait_type_id(TypeId::of::<dyn Blah>()) }.is_none());
+    /// ```
+    #[unstable(feature = "type_info", issue = "146922")]
+    #[rustc_const_unstable(feature = "type_info", issue = "146922")]
+    pub const fn trait_info_of_trait_type_id(
+        self,
+        trait_represented_by_type_id: TypeId,
+    ) -> Option<TraitImpl<*const ()>> {
+        if self.info().size.is_none() {
+            return None;
+        }
+
+        if matches!(trait_represented_by_type_id.info().kind, TypeKind::DynTrait(_))
+            && let Some(vtable) = type_id_vtable(self, trait_represented_by_type_id)
+        {
+            Some(TraitImpl { vtable })
+        } else {
+            None
+        }
     }
 
     fn as_u128(self) -> u128 {
@@ -948,7 +1012,8 @@ pub const fn try_as_dyn<
 >(
     t: &T,
 ) -> Option<&U> {
-    let vtable: Option<ptr::DynMetadata<U>> = const { intrinsics::vtable_for::<T, U>() };
+    let vtable: Option<ptr::DynMetadata<U>> =
+        const { TypeId::of::<T>().trait_info_of::<U>().as_ref().map(TraitImpl::get_vtable) };
     match vtable {
         Some(dyn_metadata) => {
             let pointer = ptr::from_raw_parts(t, dyn_metadata);
@@ -1001,7 +1066,8 @@ pub const fn try_as_dyn_mut<
 >(
     t: &mut T,
 ) -> Option<&mut U> {
-    let vtable: Option<ptr::DynMetadata<U>> = const { intrinsics::vtable_for::<T, U>() };
+    let vtable: Option<ptr::DynMetadata<U>> =
+        const { TypeId::of::<T>().trait_info_of::<U>().as_ref().map(TraitImpl::get_vtable) };
     match vtable {
         Some(dyn_metadata) => {
             let pointer = ptr::from_raw_parts_mut(t, dyn_metadata);

@@ -11,7 +11,6 @@ pub(crate) struct InlineParser;
 
 impl<S: Stage> SingleAttributeParser<S> for InlineParser {
     const PATH: &[Symbol] = &[sym::inline];
-    const ATTRIBUTE_ORDER: AttributeOrder = AttributeOrder::KeepOutermost;
     const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::WarnButFutureError;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
@@ -38,10 +37,7 @@ impl<S: Stage> SingleAttributeParser<S> for InlineParser {
         match args {
             ArgParser::NoArgs => Some(AttributeKind::Inline(InlineAttr::Hint, cx.attr_span)),
             ArgParser::List(list) => {
-                let Some(l) = list.single() else {
-                    cx.expected_single_argument(list.span);
-                    return None;
-                };
+                let l = cx.expect_single(list)?;
 
                 match l.meta_item().and_then(|i| i.path().word_sym()) {
                     Some(sym::always) => {
@@ -51,13 +47,13 @@ impl<S: Stage> SingleAttributeParser<S> for InlineParser {
                         Some(AttributeKind::Inline(InlineAttr::Never, cx.attr_span))
                     }
                     _ => {
-                        cx.expected_specific_argument(l.span(), &[sym::always, sym::never]);
+                        cx.adcx().expected_specific_argument(l.span(), &[sym::always, sym::never]);
                         return None;
                     }
                 }
             }
             ArgParser::NameValue(_) => {
-                cx.warn_ill_formed_attribute_input(ILL_FORMED_ATTRIBUTE_INPUT);
+                cx.adcx().warn_ill_formed_attribute_input(ILL_FORMED_ATTRIBUTE_INPUT);
                 return None;
             }
         }
@@ -68,8 +64,6 @@ pub(crate) struct RustcForceInlineParser;
 
 impl<S: Stage> SingleAttributeParser<S> for RustcForceInlineParser {
     const PATH: &[Symbol] = &[sym::rustc_force_inline];
-    const ATTRIBUTE_ORDER: AttributeOrder = AttributeOrder::KeepOutermost;
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::WarnButFutureError;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -81,13 +75,10 @@ impl<S: Stage> SingleAttributeParser<S> for RustcForceInlineParser {
         let reason = match args {
             ArgParser::NoArgs => None,
             ArgParser::List(list) => {
-                let Some(l) = list.single() else {
-                    cx.expected_single_argument(list.span);
-                    return None;
-                };
+                let l = cx.expect_single(list)?;
 
                 let Some(reason) = l.lit().and_then(|i| i.kind.str()) else {
-                    cx.expected_string_literal(l.span(), l.lit());
+                    cx.adcx().expected_string_literal(l.span(), l.lit());
                     return None;
                 };
 
@@ -95,7 +86,7 @@ impl<S: Stage> SingleAttributeParser<S> for RustcForceInlineParser {
             }
             ArgParser::NameValue(v) => {
                 let Some(reason) = v.value_as_str() else {
-                    cx.expected_string_literal(v.value_span, Some(v.value_as_lit()));
+                    cx.adcx().expected_string_literal(v.value_span, Some(v.value_as_lit()));
                     return None;
                 };
 

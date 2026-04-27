@@ -382,6 +382,7 @@ enum FlycheckCommandOrigin {
     ProjectJsonRunnable,
 }
 
+#[derive(Debug)]
 enum StateChange {
     Restart {
         generation: DiagnosticsGeneration,
@@ -435,6 +436,7 @@ enum DiagnosticsReceived {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 enum Event {
     RequestStateChange(StateChange),
     CheckEvent(Option<CheckMessage>),
@@ -445,6 +447,7 @@ const SAVED_FILE_PLACEHOLDER_DOLLAR: &str = "$saved_file";
 const LABEL_INLINE: &str = "{label}";
 const SAVED_FILE_INLINE: &str = "{saved_file}";
 
+#[derive(Debug)]
 struct Substitutions<'a> {
     label: Option<&'a str>,
     saved_file: Option<&'a str>,
@@ -556,17 +559,37 @@ impl FlycheckActor {
                     self.cancel_check_process();
                 }
                 Event::RequestStateChange(StateChange::Restart {
-                    generation,
-                    scope,
-                    saved_file,
-                    target,
+                    mut generation,
+                    mut scope,
+                    mut saved_file,
+                    mut target,
                 }) => {
                     // Cancel the previously spawned process
                     self.cancel_check_process();
+
+                    // Debounce by briefly waiting for other state changes.
                     while let Ok(restart) = inbox.recv_timeout(Duration::from_millis(50)) {
-                        // restart chained with a stop, so just cancel
-                        if let StateChange::Cancel = restart {
-                            continue 'event;
+                        match restart {
+                            StateChange::Cancel => {
+                                // We got a cancel straight after this restart request, so
+                                // don't do anything.
+                                continue 'event;
+                            }
+                            StateChange::Restart {
+                                generation: g,
+                                scope: s,
+                                saved_file: sf,
+                                target: t,
+                            } => {
+                                // We got another restart request. Take the parameters
+                                // from the last restart request in this time window,
+                                // because the most recent request is probably the most
+                                // relevant to the user.
+                                generation = g;
+                                scope = s;
+                                saved_file = sf;
+                                target = t;
+                            }
                         }
                     }
 
@@ -650,27 +673,31 @@ impl FlycheckActor {
                     if self.diagnostics_received == DiagnosticsReceived::NotYet {
                         tracing::trace!(flycheck_id = self.id, "clearing diagnostics");
                         // We finished without receiving any diagnostics.
-                        // Clear everything for good measure
-                        match &self.scope {
-                            FlycheckScope::Workspace => {
-                                self.send(FlycheckMessage::ClearDiagnostics {
-                                    id: self.id,
-                                    kind: ClearDiagnosticsKind::All(ClearScope::Workspace),
-                                });
-                            }
-                            FlycheckScope::Package { package, workspace_deps } => {
-                                for pkg in
-                                    std::iter::once(package).chain(workspace_deps.iter().flatten())
-                                {
-                                    self.send(FlycheckMessage::ClearDiagnostics {
-                                        id: self.id,
-                                        kind: ClearDiagnosticsKind::All(ClearScope::Package(
-                                            pkg.clone(),
-                                        )),
-                                    });
-                                }
-                            }
-                        }
+                        //
+                        // `cargo check` generally outputs something, even if there are no
+                        // warnings/errors, so we always know which package was checked.
+                        //
+                        // ```text
+                        // $ cargo check --message-format=json 2>/dev/null
+                        // {"reason":"compiler-artifact","package_id":"path+file:///Users/wilfred/tmp/scratch#0.1.0",...}
+                        // ```
+                        //
+                        // However, rustc only returns JSON if there are diagnostics present, so a
+                        // build without warnings or errors has an empty output.
+                        //
+                        // ```
+                        // $ rustc --error-format=json bad.rs
+                        // {"$message_type":"diagnostic","message":"mismatched types","...}
+                        //
+                        // $ rustc --error-format=json good.rs
+                        // ```
+                        //
+                        // So if we got zero diagnostics, it was almost certainly a check that
+                        // wasn't specific to a package.
+                        self.send(FlycheckMessage::ClearDiagnostics {
+                            id: self.id,
+                            kind: ClearDiagnosticsKind::All(ClearScope::Workspace),
+                        });
                     } else if res.is_ok() {
                         // We clear diagnostics for packages on
                         // `[CargoCheckMessage::CompilerArtifact]` but there seem to be setups where
@@ -950,6 +977,7 @@ impl FlycheckActor {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 enum CheckMessage {
     /// A message from `cargo check`, including details like the path
     /// to the relevant `Cargo.toml`.
@@ -997,7 +1025,7 @@ impl JsonLinesParser<CheckMessage> for CheckParser {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 #[serde(untagged)]
 enum JsonMessage {
     Cargo(cargo_metadata::Message),

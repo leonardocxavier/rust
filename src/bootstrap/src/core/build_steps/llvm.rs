@@ -23,7 +23,7 @@ use crate::core::config::{Config, TargetSelection};
 use crate::utils::build_stamp::{BuildStamp, generate_smart_stamp_hash};
 use crate::utils::exec::command;
 use crate::utils::helpers::{
-    self, exe, get_clang_cl_resource_dir, t, unhashed_basename, up_to_date,
+    self, exe, get_clang_cl_resource_dir, libdir, t, unhashed_basename, up_to_date,
 };
 use crate::{CLang, GitRepo, Kind, trace};
 
@@ -561,7 +561,6 @@ impl Step for Llvm {
             }
         };
 
-        // FIXME(ZuseZ4): Do we need that for Enzyme too?
         // When building LLVM with LLVM_LINK_LLVM_DYLIB for macOS, an unversioned
         // libLLVM.dylib will be built. However, llvm-config will still look
         // for a versioned path like libLLVM-14.dylib. Manually create a symbolic
@@ -632,11 +631,11 @@ fn check_llvm_version(builder: &Builder<'_>, llvm_config: &Path) {
     let version = get_llvm_version(builder, llvm_config);
     let mut parts = version.split('.').take(2).filter_map(|s| s.parse::<u32>().ok());
     if let (Some(major), Some(_minor)) = (parts.next(), parts.next())
-        && major >= 20
+        && major >= 21
     {
         return;
     }
-    panic!("\n\nbad LLVM version: {version}, need >=20\n\n")
+    panic!("\n\nbad LLVM version: {version}, need >=21\n\n")
 }
 
 fn configure_cmake(
@@ -651,6 +650,18 @@ fn configure_cmake(
     // Do not print installation messages for up-to-date files.
     // LLVM and LLD builds can produce a lot of those and hit CI limits on log size.
     cfg.define("CMAKE_INSTALL_MESSAGE", "LAZY");
+
+    if builder.config.quiet {
+        // Only log errors and warnings from `cmake`.
+        cfg.define("CMAKE_MESSAGE_LOG_LEVEL", "WARNING");
+
+        // If we're configuring llvm to build with `ninja`, we can suppress output from it with
+        // `--quiet`. Otherwise don't add anything since we don't know which build system is going
+        // to use.
+        if builder.ninja() {
+            cfg.build_arg("--quiet");
+        }
+    }
 
     // Do not allow the user's value of DESTDIR to influence where
     // LLVM will install itself. LLVM must always be installed in our
@@ -773,7 +784,15 @@ fn configure_cmake(
         .define("CMAKE_CXX_COMPILER", sanitize_cc(&cxx))
         .define("CMAKE_ASM_COMPILER", sanitize_cc(&cc));
 
-    cfg.build_arg("-j").build_arg(builder.jobs().to_string());
+    // If we are running under a FIFO jobserver, we should not pass -j to CMake; otherwise it
+    // overrides the jobserver settings and can lead to oversubscription.
+    let has_modern_jobserver = env::var("MAKEFLAGS")
+        .map(|flags| flags.contains("--jobserver-auth=fifo:"))
+        .unwrap_or(false);
+
+    if !has_modern_jobserver {
+        cfg.build_arg("-j").build_arg(builder.jobs().to_string());
+    }
     let mut cflags = ccflags.cflags.clone();
     // FIXME(madsmtm): Allow `cmake-rs` to select flags by itself by passing
     // our flags via `.cflag`/`.cxxflag` instead.
@@ -1144,12 +1163,18 @@ impl Step for Enzyme {
 
         let LlvmResult { host_llvm_config, llvm_cmake_dir } = builder.ensure(Llvm { target });
 
+        // Enzyme links against LLVM. If we update the LLVM submodule libLLVM might get a new
+        // version number, in which case Enzyme will now fail to find LLVM. By including the LLVM
+        // hash into the Enzyme hash we force a rebuild of Enzyme when updating LLVM.
+        let enzyme_hash_input = builder.in_tree_llvm_info.sha().unwrap_or_default().to_owned()
+            + builder.enzyme_info.sha().unwrap_or_default();
+
         static STAMP_HASH_MEMO: OnceLock<String> = OnceLock::new();
         let smart_stamp_hash = STAMP_HASH_MEMO.get_or_init(|| {
             generate_smart_stamp_hash(
                 builder,
                 &builder.config.src.join("src/tools/enzyme"),
-                builder.enzyme_info.sha().unwrap_or_default(),
+                &enzyme_hash_input,
             )
         });
 
@@ -1159,7 +1184,7 @@ impl Step for Enzyme {
         let llvm_version_major = llvm::get_llvm_version_major(builder, &host_llvm_config);
         let lib_ext = std::env::consts::DLL_EXTENSION;
         let libenzyme = format!("libEnzyme-{llvm_version_major}");
-        let build_dir = out_dir.join("lib");
+        let build_dir = out_dir.join(libdir(target));
         let dylib = build_dir.join(&libenzyme).with_extension(lib_ext);
 
         trace!("checking build stamp to see if we need to rebuild enzyme artifacts");
@@ -1197,7 +1222,16 @@ impl Step for Enzyme {
         // hard to spot more relevant issues.
         let mut cflags = CcFlags::default();
         cflags.push_all("-Wno-deprecated");
-        configure_cmake(builder, target, &mut cfg, true, LdFlags::default(), cflags, &[]);
+
+        // Logic copied from `configure_llvm`
+        // ThinLTO is only available when building with LLVM, enabling LLD is required.
+        // Apple's linker ld64 supports ThinLTO out of the box though, so don't use LLD on Darwin.
+        let mut ldflags = LdFlags::default();
+        if builder.config.llvm_thin_lto && !target.contains("apple") {
+            ldflags.push_all("-fuse-ld=lld");
+        }
+
+        configure_cmake(builder, target, &mut cfg, true, ldflags, cflags, &[]);
 
         // Re-use the same flags as llvm to control the level of debug information
         // generated by Enzyme.
@@ -1536,6 +1570,8 @@ fn supported_sanitizers(
             &["asan", "dfsan", "lsan", "msan", "safestack", "tsan", "rtsan"],
         ),
         "x86_64-unknown-linux-gnuasan" => common_libs("linux", "x86_64", &["asan"]),
+        "x86_64-unknown-linux-gnumsan" => common_libs("linux", "x86_64", &["msan"]),
+        "x86_64-unknown-linux-gnutsan" => common_libs("linux", "x86_64", &["tsan"]),
         "x86_64-unknown-linux-musl" => {
             common_libs("linux", "x86_64", &["asan", "lsan", "msan", "tsan"])
         }

@@ -10,8 +10,7 @@ use rustc_middle::mir::*;
 use rustc_middle::span_bug;
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty};
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, sym};
+use rustc_span::{DUMMY_SP, Spanned, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use tracing::{debug, instrument};
 
@@ -370,7 +369,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             // Some intrinsics are handled here because they desperately want to avoid introducing
             // unnecessary copies.
             ExprKind::Call { ty, fun, ref args, .. }
-                if let ty::FnDef(def_id, generic_args) = ty.kind()
+                if let ty::FnDef(def_id, generic_args) = *ty.kind()
                     && let Some(intrinsic) = this.tcx.intrinsic(def_id)
                     && matches!(intrinsic.name, sym::write_via_move | sym::write_box_via_move) =>
             {

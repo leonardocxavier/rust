@@ -2,6 +2,7 @@
 //!
 //! Currently, this pass only propagates scalar values.
 
+use std::assert_matches;
 use std::cell::RefCell;
 use std::fmt::Formatter;
 
@@ -10,7 +11,6 @@ use rustc_const_eval::const_eval::{DummyMachine, throw_machine_stop_str};
 use rustc_const_eval::interpret::{
     ImmTy, Immediate, InterpCx, OpTy, PlaceTy, Projectable, interp_ok,
 };
-use rustc_data_structures::assert_matches;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def::DefKind;
 use rustc_middle::bug;
@@ -41,6 +41,11 @@ impl<'tcx> crate::MirPass<'tcx> for DataflowConstProp {
 
     #[instrument(skip_all level = "debug")]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        // Avoid query cycles from coroutines.
+        if body.coroutine.is_some() {
+            return;
+        }
+
         debug!(def_id = ?body.source.def_id());
         if tcx.sess.mir_opt_level() < 4 && body.basic_blocks.len() > BLOCK_LIMIT {
             debug!("aborted dataflow const prop due too many basic blocks");

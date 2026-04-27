@@ -280,7 +280,7 @@ pub fn eq_arm(l: &Arm, r: &Arm) -> bool {
     l.is_placeholder == r.is_placeholder
         && eq_pat(&l.pat, &r.pat)
         && eq_expr_opt(l.body.as_deref(), r.body.as_deref())
-        && eq_expr_opt(l.guard.as_deref(), r.guard.as_deref())
+        && eq_expr_opt(l.guard.as_deref().map(|g| &g.cond), r.guard.as_deref().map(|g| &g.cond))
         && over(&l.attrs, &r.attrs, eq_attr)
 }
 
@@ -339,6 +339,7 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 expr: le,
                 safety: ls,
                 define_opaque: _,
+                eii_impls: _,
             }),
             Static(box StaticItem {
                 ident: ri,
@@ -347,6 +348,7 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 expr: re,
                 safety: rs,
                 define_opaque: _,
+                eii_impls: _,
             }),
         ) => eq_id(*li, *ri) && lm == rm && ls == rs && eq_ty(lt, rt) && eq_expr_opt(le.as_deref(), re.as_deref()),
         (
@@ -446,6 +448,7 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
         },
         (
             Trait(box ast::Trait {
+                impl_restriction: liprt,
                 constness: lc,
                 is_auto: la,
                 safety: lu,
@@ -455,6 +458,7 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 items: lis,
             }),
             Trait(box ast::Trait {
+                impl_restriction: riprt,
                 constness: rc,
                 is_auto: ra,
                 safety: ru,
@@ -464,7 +468,8 @@ pub fn eq_item_kind(l: &ItemKind, r: &ItemKind) -> bool {
                 items: ris,
             }),
         ) => {
-            matches!(lc, ast::Const::No) == matches!(rc, ast::Const::No)
+            eq_impl_restriction(liprt, riprt)
+                && matches!(lc, ast::Const::No) == matches!(rc, ast::Const::No)
                 && la == ra
                 && matches!(lu, Safety::Default) == matches!(ru, Safety::Default)
                 && eq_id(*li, *ri)
@@ -537,6 +542,7 @@ pub fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 expr: le,
                 safety: ls,
                 define_opaque: _,
+                eii_impls: _,
             }),
             Static(box StaticItem {
                 ident: ri,
@@ -545,6 +551,7 @@ pub fn eq_foreign_item_kind(l: &ForeignItemKind, r: &ForeignItemKind) -> bool {
                 expr: re,
                 safety: rs,
                 define_opaque: _,
+                eii_impls: _,
             }),
         ) => eq_id(*li, *ri) && eq_ty(lt, rt) && lm == rm && eq_expr_opt(le.as_deref(), re.as_deref()) && ls == rs,
         (
@@ -809,7 +816,7 @@ pub fn eq_const_item_rhs(l: &ConstItemRhsKind, r: &ConstItemRhsKind) -> bool {
 pub fn eq_use_tree_kind(l: &UseTreeKind, r: &UseTreeKind) -> bool {
     use UseTreeKind::*;
     match (l, r) {
-        (Glob, Glob) => true,
+        (Glob(_), Glob(_)) => true,
         (Simple(l), Simple(r)) => both(l.as_ref(), r.as_ref(), |l, r| eq_id(*l, *r)),
         (Nested { items: l, .. }, Nested { items: r, .. }) => over(l, r, |(l, _), (r, _)| eq_use_tree(l, r)),
         _ => false,
@@ -820,8 +827,8 @@ pub fn eq_defaultness(l: Defaultness, r: Defaultness) -> bool {
     matches!(
         (l, r),
         (Defaultness::Implicit, Defaultness::Implicit)
-        | (Defaultness::Default(_), Defaultness::Default(_))
-        | (Defaultness::Final(_), Defaultness::Final(_))
+            | (Defaultness::Default(_), Defaultness::Default(_))
+            | (Defaultness::Final(_), Defaultness::Final(_))
     )
 }
 
@@ -830,6 +837,29 @@ pub fn eq_vis(l: &Visibility, r: &Visibility) -> bool {
     match (&l.kind, &r.kind) {
         (Public, Public) | (Inherited, Inherited) => true,
         (Restricted { path: l, .. }, Restricted { path: r, .. }) => eq_path(l, r),
+        _ => false,
+    }
+}
+
+pub fn eq_impl_restriction(l: &ImplRestriction, r: &ImplRestriction) -> bool {
+    eq_restriction_kind(&l.kind, &r.kind)
+}
+
+fn eq_restriction_kind(l: &RestrictionKind, r: &RestrictionKind) -> bool {
+    match (l, r) {
+        (RestrictionKind::Unrestricted, RestrictionKind::Unrestricted) => true,
+        (
+            RestrictionKind::Restricted {
+                path: l_path,
+                shorthand: l_short,
+                id: _,
+            },
+            RestrictionKind::Restricted {
+                path: r_path,
+                shorthand: r_short,
+                id: _,
+            },
+        ) => l_short == r_short && eq_path(l_path, r_path),
         _ => false,
     }
 }

@@ -52,8 +52,8 @@ impl<S: Stage> CombineAttributeParser<S> for UnstableFeatureBoundParser {
     }
 }
 
-pub(crate) struct AllowConstFnUnstableParser;
-impl<S: Stage> CombineAttributeParser<S> for AllowConstFnUnstableParser {
+pub(crate) struct RustcAllowConstFnUnstableParser;
+impl<S: Stage> CombineAttributeParser<S> for RustcAllowConstFnUnstableParser {
     const PATH: &[Symbol] = &[sym::rustc_allow_const_fn_unstable];
     type Item = Symbol;
     const CONVERT: ConvertFn<Self::Item> =
@@ -81,7 +81,7 @@ fn parse_unstable<S: Stage>(
 ) -> impl IntoIterator<Item = Symbol> {
     let mut res = Vec::new();
 
-    let Some(list) = args.list() else {
+    let Some(list) = args.as_list() else {
         cx.emit_err(session_diagnostics::ExpectsFeatureList {
             span: cx.attr_span,
             name: symbol.to_ident_string(),

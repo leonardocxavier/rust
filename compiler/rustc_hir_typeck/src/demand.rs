@@ -1,5 +1,4 @@
 use rustc_errors::{Applicability, Diag, MultiSpan, listify};
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, find_attr};
@@ -347,7 +346,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     match infer {
                         ty::TyVar(_) => self.next_ty_var(DUMMY_SP),
                         ty::IntVar(_) => self.next_int_var(),
-                        ty::FloatVar(_) => self.next_float_var(),
+                        ty::FloatVar(_) => self.next_float_var(DUMMY_SP, None),
                         ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => {
                             bug!("unexpected fresh ty outside of the trait solver")
                         }
@@ -724,7 +723,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         hir::Path {
                             res:
                                 hir::def::Res::Def(
-                                    hir::def::DefKind::Static { .. } | hir::def::DefKind::Const,
+                                    hir::def::DefKind::Static { .. }
+                                    | hir::def::DefKind::Const { .. },
                                     def_id,
                                 ),
                             ..
@@ -1008,7 +1008,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         );
         let container_id = pick.item.container_id(self.tcx);
         let container = with_no_trimmed_paths!(self.tcx.def_path_str(container_id));
-        for def_id in pick.import_ids {
+        for &def_id in pick.import_ids {
             let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
             path_span
                 .push_span_label(self.tcx.hir_span(hir_id), format!("`{container}` imported here"));
@@ -1092,7 +1092,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 //
                 // FIXME? Other potential candidate methods: `as_ref` and
                 // `as_mut`?
-                && find_attr!(self.tcx.get_all_attrs(m.def_id), AttributeKind::RustcConversionSuggestion)
+                && find_attr!(self.tcx, m.def_id, RustcConversionSuggestion)
             },
         );
 

@@ -293,6 +293,7 @@ pub(crate) enum AttributeKind {
     CapturesNone = 46,
     SanitizeRealtimeNonblocking = 47,
     SanitizeRealtimeBlocking = 48,
+    Convergent = 49,
 }
 
 /// LLVMIntPredicate
@@ -464,6 +465,8 @@ pub(crate) struct SanitizerOptions {
     pub sanitize_hwaddress_recover: bool,
     pub sanitize_kernel_address: bool,
     pub sanitize_kernel_address_recover: bool,
+    pub sanitize_kernel_hwaddress: bool,
+    pub sanitize_kernel_hwaddress_recover: bool,
 }
 
 /// LLVMRustRelocModel
@@ -536,9 +539,6 @@ pub(crate) enum DiagnosticLevel {
 unsafe extern "C" {
     // LLVMRustThinLTOData
     pub(crate) type ThinLTOData;
-
-    // LLVMRustThinLTOBuffer
-    pub(crate) type ThinLTOBuffer;
 }
 
 /// LLVMRustThinLTOModule
@@ -848,7 +848,7 @@ bitflags! {
 }
 
 unsafe extern "C" {
-    pub(crate) type ModuleBuffer;
+    pub(crate) type Buffer;
 }
 
 pub(crate) type SelfProfileBeforePassCallback =
@@ -921,6 +921,9 @@ unsafe extern "C" {
     pub(crate) fn LLVMDoubleTypeInContext(C: &Context) -> &Type;
     pub(crate) fn LLVMFP128TypeInContext(C: &Context) -> &Type;
 
+    // Operations on non-IEEE real types
+    pub(crate) fn LLVMBFloatTypeInContext(C: &Context) -> &Type;
+
     // Operations on function types
     pub(crate) fn LLVMFunctionType<'a>(
         ReturnType: &'a Type,
@@ -930,6 +933,8 @@ unsafe extern "C" {
     ) -> &'a Type;
     pub(crate) fn LLVMCountParamTypes(FunctionTy: &Type) -> c_uint;
     pub(crate) fn LLVMGetParamTypes<'a>(FunctionTy: &'a Type, Dest: *mut &'a Type);
+    pub(crate) fn LLVMGetReturnType(FunctionTy: &Type) -> &Type;
+    pub(crate) fn LLVMIsFunctionVarArg(FunctionTy: &Type) -> Bool;
 
     // Operations on struct types
     pub(crate) fn LLVMStructTypeInContext<'a>(
@@ -1084,12 +1089,18 @@ unsafe extern "C" {
 
     // Operations about llvm intrinsics
     pub(crate) fn LLVMLookupIntrinsicID(Name: *const c_char, NameLen: size_t) -> c_uint;
+    pub(crate) fn LLVMIntrinsicIsOverloaded(ID: NonZero<c_uint>) -> Bool;
     pub(crate) fn LLVMGetIntrinsicDeclaration<'a>(
         Mod: &'a Module,
         ID: NonZero<c_uint>,
         ParamTypes: *const &'a Type,
         ParamCount: size_t,
     ) -> &'a Value;
+    pub(crate) fn LLVMRustUpgradeIntrinsicFunction<'a>(
+        Fn: &'a Value,
+        NewFn: &mut Option<&'a Value>,
+    ) -> bool;
+    pub(crate) fn LLVMRustIsTargetIntrinsic(ID: NonZero<c_uint>) -> bool;
 
     // Operations on parameters
     pub(crate) fn LLVMIsAArgument(Val: &Value) -> Option<&Value>;
@@ -1605,6 +1616,9 @@ unsafe extern "C" {
         Packed: Bool,
     );
 
+    pub(crate) fn LLVMCountStructElementTypes(StructTy: &Type) -> c_uint;
+    pub(crate) fn LLVMGetStructElementTypes<'a>(StructTy: &'a Type, Dest: *mut &'a Type);
+
     pub(crate) safe fn LLVMMetadataAsValue<'a>(C: &'a Context, MD: &'a Metadata) -> &'a Value;
 
     pub(crate) safe fn LLVMSetUnnamedAddress(Global: &Value, UnnamedAddr: UnnamedAddr);
@@ -1989,6 +2003,13 @@ unsafe extern "C" {
         NameLen: size_t,
         T: &'a Type,
     ) -> &'a Value;
+    pub(crate) fn LLVMRustGetOrInsertGlobalInAddrspace<'a>(
+        M: &'a Module,
+        Name: *const c_char,
+        NameLen: size_t,
+        T: &'a Type,
+        AddressSpace: c_uint,
+    ) -> &'a Value;
     pub(crate) fn LLVMRustGetNamedValue(
         M: &Module,
         Name: *const c_char,
@@ -2048,6 +2069,7 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetFastMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAlgebraicMath(Instr: &Value);
     pub(crate) fn LLVMRustSetAllowReassoc(Instr: &Value);
+    pub(crate) fn LLVMRustSetNoSignedZeros(Instr: &Value);
 
     // Miscellaneous instructions
     pub(crate) fn LLVMRustBuildMemCpy<'a>(
@@ -2302,6 +2324,23 @@ unsafe extern "C" {
         Params: Option<&'a DIArray>,
     );
 
+    pub(crate) fn LLVMRustDIGetOrCreateSubrange<'a>(
+        Builder: &DIBuilder<'a>,
+        CountNode: Option<&'a Metadata>,
+        LB: &'a Metadata,
+        UB: &'a Metadata,
+        Stride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
+
+    pub(crate) fn LLVMRustDICreateVectorType<'a>(
+        Builder: &DIBuilder<'a>,
+        Size: u64,
+        AlignInBits: u32,
+        Type: &'a DIType,
+        Subscripts: &'a DIArray,
+        BitStride: Option<&'a Metadata>,
+    ) -> &'a Metadata;
+
     pub(crate) fn LLVMRustDILocationCloneWithBaseDiscriminator<'a>(
         Location: &'a DILocation,
         BD: c_uint,
@@ -2375,9 +2414,8 @@ unsafe extern "C" {
         NoPrepopulatePasses: bool,
         VerifyIR: bool,
         LintIR: bool,
-        ThinLTOBuffer: Option<&mut *mut ThinLTOBuffer>,
-        EmitThinLTO: bool,
-        EmitThinLTOSummary: bool,
+        ThinLTOBuffer: Option<&mut Option<crate::back::lto::Buffer>>,
+        ThinLTOSummaryBuffer: Option<&mut Option<crate::back::lto::Buffer>>,
         MergeFunctions: bool,
         UnrollLoops: bool,
         SLPVectorize: bool,
@@ -2458,22 +2496,13 @@ unsafe extern "C" {
     pub(crate) fn LLVMRustSetModulePICLevel(M: &Module);
     pub(crate) fn LLVMRustSetModulePIELevel(M: &Module);
     pub(crate) fn LLVMRustSetModuleCodeModel(M: &Module, Model: CodeModel);
-    pub(crate) fn LLVMRustModuleBufferCreate(M: &Module) -> &'static mut ModuleBuffer;
-    pub(crate) fn LLVMRustModuleBufferPtr(p: &ModuleBuffer) -> *const u8;
-    pub(crate) fn LLVMRustModuleBufferLen(p: &ModuleBuffer) -> usize;
-    pub(crate) fn LLVMRustModuleBufferFree(p: &'static mut ModuleBuffer);
+    pub(crate) fn LLVMRustBufferPtr(p: &Buffer) -> *const u8;
+    pub(crate) fn LLVMRustBufferLen(p: &Buffer) -> usize;
+    pub(crate) fn LLVMRustBufferFree(p: &'static mut Buffer);
     pub(crate) fn LLVMRustModuleCost(M: &Module) -> u64;
     pub(crate) fn LLVMRustModuleInstructionStats(M: &Module) -> u64;
 
-    pub(crate) fn LLVMRustThinLTOBufferCreate(
-        M: &Module,
-        is_thin: bool,
-    ) -> &'static mut ThinLTOBuffer;
-    pub(crate) fn LLVMRustThinLTOBufferFree(M: &'static mut ThinLTOBuffer);
-    pub(crate) fn LLVMRustThinLTOBufferPtr(M: &ThinLTOBuffer) -> *const c_char;
-    pub(crate) fn LLVMRustThinLTOBufferLen(M: &ThinLTOBuffer) -> size_t;
-    pub(crate) fn LLVMRustThinLTOBufferThinLinkDataPtr(M: &ThinLTOBuffer) -> *const c_char;
-    pub(crate) fn LLVMRustThinLTOBufferThinLinkDataLen(M: &ThinLTOBuffer) -> size_t;
+    pub(crate) fn LLVMRustModuleSerialize(M: &Module, is_thin: bool) -> &'static mut Buffer;
     pub(crate) fn LLVMRustCreateThinLTOData(
         Modules: *const ThinLTOModule,
         NumModules: size_t,

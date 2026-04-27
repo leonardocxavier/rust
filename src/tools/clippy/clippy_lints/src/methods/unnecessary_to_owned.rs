@@ -382,7 +382,7 @@ fn check_other_call_arg<'tcx>(
 ) -> bool {
     if let Some((maybe_call, maybe_arg)) = skip_addr_of_ancestors(cx, expr)
         && let Some((callee_def_id, _, recv, call_args)) = get_callee_generic_args_and_args(cx, maybe_call)
-        && let fn_sig = cx.tcx.fn_sig(callee_def_id).instantiate_identity().skip_binder()
+        && let fn_sig = cx.tcx.fn_sig(callee_def_id).instantiate_identity().skip_norm_wip().skip_binder()
         && let Some(i) = recv.into_iter().chain(call_args).position(|arg| arg.hir_id == maybe_arg.hir_id)
         && let Some(input) = fn_sig.inputs().get(i)
         && let (input, n_refs, _) = peel_and_count_ty_refs(*input)
@@ -482,15 +482,11 @@ fn get_input_traits_and_projections<'tcx>(
     let mut projection_predicates = Vec::new();
     for predicate in cx.tcx.param_env(callee_def_id).caller_bounds() {
         match predicate.kind().skip_binder() {
-            ClauseKind::Trait(trait_predicate) => {
-                if trait_predicate.trait_ref.self_ty() == input {
-                    trait_predicates.push(trait_predicate);
-                }
+            ClauseKind::Trait(trait_predicate) if trait_predicate.trait_ref.self_ty() == input => {
+                trait_predicates.push(trait_predicate);
             },
-            ClauseKind::Projection(projection_predicate) => {
-                if projection_predicate.projection_term.self_ty() == input {
-                    projection_predicates.push(projection_predicate);
-                }
+            ClauseKind::Projection(projection_predicate) if projection_predicate.projection_term.self_ty() == input => {
+                projection_predicates.push(projection_predicate);
             },
             _ => {},
         }
@@ -573,7 +569,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                             }));
 
                         if trait_predicates.any(|predicate| {
-                            let predicate = bound_fn_sig.rebind(predicate).instantiate(cx.tcx, new_subst);
+                            let predicate = bound_fn_sig.rebind(predicate).instantiate(cx.tcx, new_subst).skip_norm_wip();
                             let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
                             !cx.tcx
                                 .infer_ctxt()
@@ -702,8 +698,7 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
             sym::to_vec => cx
                 .tcx
                 .impl_of_assoc(method_def_id)
-                .filter(|&impl_did| cx.tcx.type_of(impl_did).instantiate_identity().is_slice())
-                .is_some(),
+                .is_some_and(|impl_did| cx.tcx.type_of(impl_did).instantiate_identity().skip_norm_wip().is_slice()),
             _ => false,
         }
         && let original_arg_ty = cx.typeck_results().node_type(caller.hir_id).peel_refs()

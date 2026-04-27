@@ -126,6 +126,26 @@ macro_rules! copy_slice_and_advance {
 // the bounds for String-join are S: Borrow<str> and for Vec-join Borrow<[T]>
 // [T] and str both impl AsRef<[T]> for some T
 // => s.borrow().as_ref() and we always have slices
+//
+// # Safety notes
+//
+// `Borrow` is a safe trait, and implementations are not required
+// to be deterministic. An inconsistent `Borrow` implementation could return slices
+// of different lengths on consecutive calls (e.g. by using interior mutability).
+//
+// This implementation calls `borrow()` multiple times:
+// 1. To calculate `reserved_len`, all elements are borrowed once.
+// 2. The first element is borrowed again when copied via `extend_from_slice`.
+// 3. Subsequent elements are borrowed a second time when building the mapped iterator.
+//
+// Risks and Mitigations:
+// - If the first element GROWS on the second borrow, the length subtraction underflows.
+//   We mitigate this by doing a `checked_sub` to panic rather than allowing an underflow
+//   that fabricates a huge destination slice.
+// - If elements 2..N GROW on their second borrow, the target slice bounds set by `checked_sub`
+//   means that `split_at_mut` inside `copy_slice_and_advance!` will correctly panic.
+// - If elements SHRINK on their second borrow, the spare space is never written, and the final
+//   length set via `set_len` masks trailing uninitialized bytes.
 #[cfg(not(no_global_oom_handling))]
 fn join_generic_copy<B, T, S>(slice: &[S], sep: &[T]) -> Vec<T>
 where
@@ -161,19 +181,21 @@ where
 
     unsafe {
         let pos = result.len();
-        let target = result.spare_capacity_mut().get_unchecked_mut(..reserved_len - pos);
+        let target_len = reserved_len.checked_sub(pos).expect("inconsistent Borrow implementation");
+        let target = result.spare_capacity_mut().get_unchecked_mut(..target_len);
 
         // Convert the separator and slices to slices of MaybeUninit
-        // to simplify implementation in specialize_for_lengths
+        // to simplify implementation in specialize_for_lengths.
         let sep_uninit = core::slice::from_raw_parts(sep.as_ptr().cast(), sep.len());
         let iter_uninit = iter.map(|it| {
             let it = it.borrow().as_ref();
             core::slice::from_raw_parts(it.as_ptr().cast(), it.len())
         });
 
-        // copy separator and slices over without bounds checks
-        // generate loops with hardcoded offsets for small separators
-        // massive improvements possible (~ x2)
+        // copy separator and slices over without bounds checks.
+        // `specialize_for_lengths!` internally calls `s.borrow()`, but because it uses
+        // the bounds-checked `split_at_mut` any misbehaving implementation
+        // will not write out of bounds.
         let remain = specialize_for_lengths!(sep_uninit, target, iter_uninit; 0, 1, 2, 3, 4);
 
         // A weird borrow implementation may return different
@@ -335,12 +357,18 @@ impl str {
 
     /// Returns the lowercase equivalent of this string slice, as a new [`String`].
     ///
-    /// 'Lowercase' is defined according to the terms of the Unicode Derived Core Property
-    /// `Lowercase`.
+    /// 'Lowercase' is defined according to the terms of
+    /// [Chapter 3 (Conformance)](https://www.unicode.org/versions/latest/core-spec/chapter-3/#G34432)
+    /// of the Unicode standard.
     ///
     /// Since some characters can expand into multiple characters when changing
     /// the case, this function returns a [`String`] instead of modifying the
     /// parameter in-place.
+    ///
+    /// Unlike [`char::to_lowercase()`], this method fully handles the context-dependent
+    /// casing of Greek sigma. However, like that method, it does not handle locale-specific
+    /// casing, like Turkish and Azeri I/ı/İ/i. See that method's documentation
+    /// for more information.
     ///
     /// # Examples
     ///
@@ -378,7 +406,9 @@ impl str {
                   without modifying the original"]
     #[stable(feature = "unicode_case_mapping", since = "1.2.0")]
     pub fn to_lowercase(&self) -> String {
-        let (mut s, rest) = convert_while_ascii(self, u8::to_ascii_lowercase);
+        // SAFETY: `to_ascii_lowercase` preserves ASCII bytes, so the converted
+        // prefix remains valid UTF-8.
+        let (mut s, rest) = unsafe { convert_while_ascii(self, u8::to_ascii_lowercase) };
 
         let prefix_len = s.len();
 
@@ -426,12 +456,17 @@ impl str {
 
     /// Returns the uppercase equivalent of this string slice, as a new [`String`].
     ///
-    /// 'Uppercase' is defined according to the terms of the Unicode Derived Core Property
-    /// `Uppercase`.
+    /// 'Uppercase' is defined according to the terms of
+    /// [Chapter 3 (Conformance)](https://www.unicode.org/versions/latest/core-spec/chapter-3/#G34431)
+    /// of the Unicode standard.
     ///
     /// Since some characters can expand into multiple characters when changing
     /// the case, this function returns a [`String`] instead of modifying the
     /// parameter in-place.
+    ///
+    /// Like [`char::to_uppercase()`] this method does not handle language-specific
+    /// casing, like Turkish and Azeri I/ı/İ/i. See that method's documentation
+    /// for more information.
     ///
     /// # Examples
     ///
@@ -463,7 +498,9 @@ impl str {
                   without modifying the original"]
     #[stable(feature = "unicode_case_mapping", since = "1.2.0")]
     pub fn to_uppercase(&self) -> String {
-        let (mut s, rest) = convert_while_ascii(self, u8::to_ascii_uppercase);
+        // SAFETY: `to_ascii_uppercase` preserves ASCII bytes, so the converted
+        // prefix remains valid UTF-8.
+        let (mut s, rest) = unsafe { convert_while_ascii(self, u8::to_ascii_uppercase) };
 
         for c in rest.chars() {
             match conversions::to_upper(c) {
@@ -626,11 +663,15 @@ pub unsafe fn from_boxed_utf8_unchecked(v: Box<[u8]>) -> Box<str> {
 ///
 /// This function is only public so that it can be verified in a codegen test,
 /// see `issue-123712-str-to-lower-autovectorization.rs`.
+///
+/// # Safety
+///
+/// `convert` must return an ASCII byte for every ASCII input byte.
 #[unstable(feature = "str_internals", issue = "none")]
 #[doc(hidden)]
 #[inline]
 #[cfg(not(no_global_oom_handling))]
-pub fn convert_while_ascii(s: &str, convert: fn(&u8) -> u8) -> (String, &str) {
+pub unsafe fn convert_while_ascii(s: &str, convert: fn(&u8) -> u8) -> (String, &str) {
     // Process the input in chunks of 16 bytes to enable auto-vectorization.
     // Previously the chunk size depended on the size of `usize`,
     // but on 32-bit platforms with sse or neon is also the better choice.

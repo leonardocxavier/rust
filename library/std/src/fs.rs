@@ -45,7 +45,6 @@ use crate::ffi::OsString;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use crate::path::{Path, PathBuf};
 use crate::sealed::Sealed;
-use crate::sync::Arc;
 use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner, fs as fs_imp};
 use crate::time::SystemTime;
 use crate::{error, fmt};
@@ -132,6 +131,7 @@ use crate::{error, fmt};
 /// [`read`]: File::read
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "File")]
+#[diagnostic::on_move(note = "you can use `File::try_clone` to duplicate a `File` instance")]
 pub struct File {
     inner: fs_imp::File,
 }
@@ -815,7 +815,8 @@ impl File {
 
     /// Acquire an exclusive lock on the file. Blocks until the lock can be acquired.
     ///
-    /// This acquires an exclusive lock; no other file handle to this file may acquire another lock.
+    /// This acquires an exclusive lock; no other file handle to this file, in this or any other
+    /// process, may acquire another lock.
     ///
     /// This lock may be advisory or mandatory. This lock is meant to interact with [`lock`],
     /// [`try_lock`], [`lock_shared`], [`try_lock_shared`], and [`unlock`]. Its interactions with
@@ -868,8 +869,8 @@ impl File {
 
     /// Acquire a shared (non-exclusive) lock on the file. Blocks until the lock can be acquired.
     ///
-    /// This acquires a shared lock; more than one file handle may hold a shared lock, but none may
-    /// hold an exclusive lock at the same time.
+    /// This acquires a shared lock; more than one file handle, in this or any other process, may
+    /// hold a shared lock, but none may hold an exclusive lock at the same time.
     ///
     /// This lock may be advisory or mandatory. This lock is meant to interact with [`lock`],
     /// [`try_lock`], [`lock_shared`], [`try_lock_shared`], and [`unlock`]. Its interactions with
@@ -923,7 +924,8 @@ impl File {
     /// Returns `Err(TryLockError::WouldBlock)` if a different lock is already held on this file
     /// (via another handle/descriptor).
     ///
-    /// This acquires an exclusive lock; no other file handle to this file may acquire another lock.
+    /// This acquires an exclusive lock; no other file handle to this file, in this or any other
+    /// process, may acquire another lock.
     ///
     /// This lock may be advisory or mandatory. This lock is meant to interact with [`lock`],
     /// [`try_lock`], [`lock_shared`], [`try_lock_shared`], and [`unlock`]. Its interactions with
@@ -987,8 +989,8 @@ impl File {
     /// Returns `Err(TryLockError::WouldBlock)` if a different lock is already held on this file
     /// (via another handle/descriptor).
     ///
-    /// This acquires a shared lock; more than one file handle may hold a shared lock, but none may
-    /// hold an exclusive lock at the same time.
+    /// This acquires a shared lock; more than one file handle, in this or any other process, may
+    /// hold a shared lock, but none may hold an exclusive lock at the same time.
     ///
     /// This lock may be advisory or mandatory. This lock is meant to interact with [`lock`],
     /// [`try_lock`], [`lock_shared`], [`try_lock_shared`], and [`unlock`]. Its interactions with
@@ -1539,58 +1541,7 @@ impl Seek for File {
         (&*self).stream_position()
     }
 }
-
-#[stable(feature = "io_traits_arc", since = "1.73.0")]
-impl Read for Arc<File> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&**self).read(buf)
-    }
-    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        (&**self).read_vectored(bufs)
-    }
-    fn read_buf(&mut self, cursor: BorrowedCursor<'_>) -> io::Result<()> {
-        (&**self).read_buf(cursor)
-    }
-    #[inline]
-    fn is_read_vectored(&self) -> bool {
-        (&**self).is_read_vectored()
-    }
-    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
-        (&**self).read_to_end(buf)
-    }
-    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
-        (&**self).read_to_string(buf)
-    }
-}
-#[stable(feature = "io_traits_arc", since = "1.73.0")]
-impl Write for Arc<File> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&**self).write(buf)
-    }
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        (&**self).write_vectored(bufs)
-    }
-    #[inline]
-    fn is_write_vectored(&self) -> bool {
-        (&**self).is_write_vectored()
-    }
-    #[inline]
-    fn flush(&mut self) -> io::Result<()> {
-        (&**self).flush()
-    }
-}
-#[stable(feature = "io_traits_arc", since = "1.73.0")]
-impl Seek for Arc<File> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        (&**self).seek(pos)
-    }
-    fn stream_len(&mut self) -> io::Result<u64> {
-        (&**self).stream_len()
-    }
-    fn stream_position(&mut self) -> io::Result<u64> {
-        (&**self).stream_position()
-    }
-}
+impl crate::io::IoHandle for File {}
 
 impl Dir {
     /// Attempts to open a directory at `path` in read-only mode.
@@ -2680,7 +2631,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 ///
 /// This function will only ever return an error of kind `NotFound` if the given
 /// path does not exist. Note that the inverse is not true,
-/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// i.e. if a path does not exist, its removal may fail for a number of reasons,
 /// such as insufficient permissions.
 ///
 /// # Examples
@@ -2894,7 +2845,7 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
 ///
 /// # Platform-specific behavior
 ///
-/// This function currently corresponds the `CreateHardLink` function on Windows.
+/// This function currently corresponds to the `CreateHardLink` function on Windows.
 /// On most Unix systems, it corresponds to the `linkat` function with no flags.
 /// On Android, VxWorks, and Redox, it instead corresponds to the `link` function.
 /// On MacOS, it uses the `linkat` function if it is available, but on very old
@@ -3150,7 +3101,7 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// This function will only ever return an error of kind `NotFound` if the given
 /// path does not exist. Note that the inverse is not true,
-/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// i.e. if a path does not exist, its removal may fail for a number of reasons,
 /// such as insufficient permissions.
 ///
 /// # Examples

@@ -4,11 +4,11 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::fs::{self, Metadata, OpenOptions};
+use crate::fs::{self, Metadata, OpenOptions, Permissions};
 use crate::io::BorrowedCursor;
 use crate::path::Path;
 use crate::sealed::Sealed;
-use crate::sys::{AsInner, AsInnerMut, IntoInner};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
 use crate::time::SystemTime;
 use crate::{io, sys};
 
@@ -138,6 +138,8 @@ impl FileExt for fs::File {
 }
 
 /// Windows-specific extensions to [`fs::OpenOptions`].
+// WARNING: This trait is not sealed. DON'T add any new methods!
+// Add them to OpenOptionsExt2 instead.
 #[stable(feature = "open_options_ext", since = "1.10.0")]
 pub trait OpenOptionsExt {
     /// Overrides the `dwDesiredAccess` argument to the call to [`CreateFile`]
@@ -305,18 +307,6 @@ pub trait OpenOptionsExt {
     ///     https://docs.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-security_impersonation_level
     #[stable(feature = "open_options_ext", since = "1.10.0")]
     fn security_qos_flags(&mut self, flags: u32) -> &mut Self;
-
-    /// If set to `true`, prevent the "last access time" of the file from being changed.
-    ///
-    /// Default to `false`.
-    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
-    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self;
-
-    /// If set to `true`, prevent the "last write time" of the file from being changed.
-    ///
-    /// Default to `false`.
-    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
-    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
 }
 
 #[stable(feature = "open_options_ext", since = "1.10.0")]
@@ -345,7 +335,28 @@ impl OpenOptionsExt for OpenOptions {
         self.as_inner_mut().security_qos_flags(flags);
         self
     }
+}
 
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+pub trait OpenOptionsExt2: Sealed {
+    /// If set to `true`, prevent the "last access time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self;
+
+    /// If set to `true`, prevent the "last write time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
+}
+
+#[unstable(feature = "sealed", issue = "none")]
+impl Sealed for OpenOptions {}
+
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+impl OpenOptionsExt2 for OpenOptions {
     fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self {
         self.as_inner_mut().freeze_last_access_time(freeze);
         self
@@ -354,6 +365,68 @@ impl OpenOptionsExt for OpenOptions {
     fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self {
         self.as_inner_mut().freeze_last_write_time(freeze);
         self
+    }
+}
+
+/// Windows-specific extensions to [`fs::Permissions`]. This extension trait
+/// provides extra utilities to shows what Windows file attributes are enabled
+/// in [`Permissions`] and to manually set file attributes on [`Permissions`].
+///
+/// See Microsoft's [`File Attribute Constants`] page to know what file
+/// attribute metadata are defined and stored on Windows files.
+///
+/// [`Permissions`]: fs::Permissions
+/// [`File Attribute Constants`]:
+///     https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
+///
+/// # Example
+///
+/// ```no_run
+/// #![feature(windows_permissions_ext)]
+/// use std::fs::Permissions;
+/// use std::os::windows::fs::PermissionsExt;
+///
+/// const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+/// const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// let my_file_attr = FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+/// let mut permissions = Permissions::from_file_attributes(my_file_attr);
+/// assert_eq!(permissions.file_attributes(), my_file_attr);
+///
+/// const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+/// let new_file_attr = permissions.file_attributes() | FILE_ATTRIBUTE_HIDDEN;
+/// permissions.set_file_attributes(new_file_attr);
+/// assert_eq!(permissions.file_attributes(), new_file_attr);
+/// ```
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+pub trait PermissionsExt: Sealed {
+    /// Returns the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn file_attributes(&self) -> u32;
+
+    /// Sets the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn set_file_attributes(&mut self, mask: u32);
+
+    /// Creates a new instance from the given file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn from_file_attributes(mask: u32) -> Self;
+}
+
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+impl Sealed for fs::Permissions {}
+
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+impl PermissionsExt for fs::Permissions {
+    fn file_attributes(&self) -> u32 {
+        self.as_inner().file_attributes()
+    }
+
+    fn set_file_attributes(&mut self, mask: u32) {
+        *self = Permissions::from_inner(FromInner::from_inner(mask));
+    }
+
+    fn from_file_attributes(mask: u32) -> Self {
+        Permissions::from_inner(FromInner::from_inner(mask))
     }
 }
 

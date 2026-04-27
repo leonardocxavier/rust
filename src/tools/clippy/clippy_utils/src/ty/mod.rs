@@ -7,7 +7,6 @@ use rustc_abi::VariantIdx;
 use rustc_ast::ast::Mutability;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Expr, FnDecl, LangItem, find_attr};
@@ -23,21 +22,19 @@ use rustc_middle::ty::{
     self, AdtDef, AliasTy, AssocItem, AssocTag, Binder, BoundRegion, BoundVarIndexKind, FnSig, GenericArg,
     GenericArgKind, GenericArgsRef, IntTy, Region, RegionKind, TraitRef, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor, UintTy, Upcast, VariantDef, VariantDiscr,
+    Unnormalized,
 };
 use rustc_span::symbol::Ident;
-use rustc_span::{DUMMY_SP, Span, Symbol, sym};
+use rustc_span::{DUMMY_SP, Span, Symbol};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_trait_selection::traits::query::normalize::QueryNormalizeExt;
 use rustc_trait_selection::traits::{Obligation, ObligationCause};
-#[cfg(bootstrap)]
-use std::assert_matches::debug_assert_matches;
 use std::collections::hash_map::Entry;
-#[cfg(not(bootstrap))]
-use std::debug_assert_matches;
-use std::{iter, mem};
+use std::{debug_assert_matches, iter, mem};
 
 use crate::paths::{PathNS, lookup_path_str};
 use crate::res::{MaybeDef, MaybeQPath};
+use crate::sym;
 
 mod type_certainty;
 pub use type_certainty::expr_type_is_certain;
@@ -105,25 +102,31 @@ pub fn contains_ty_adt_constructor_opaque<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'
                     return true;
                 }
 
-                if let ty::Alias(ty::Opaque, AliasTy { def_id, .. }) = *inner_ty.kind() {
+                if let ty::Alias(AliasTy {
+                    kind: ty::Opaque { def_id },
+                    ..
+                }) = *inner_ty.kind()
+                {
                     if !seen.insert(def_id) {
                         return false;
                     }
 
-                    for (predicate, _span) in cx.tcx.explicit_item_self_bounds(def_id).iter_identity_copied() {
+                    for (predicate, _span) in cx.tcx.explicit_item_self_bounds(def_id)
+                        .iter_identity_copied()
+                        .map(Unnormalized::skip_norm_wip)
+                    {
                         match predicate.kind().skip_binder() {
                             // For `impl Trait<U>`, it will register a predicate of `T: Trait<U>`, so we go through
                             // and check substitutions to find `U`.
-                            ty::ClauseKind::Trait(trait_predicate) => {
+                            ty::ClauseKind::Trait(trait_predicate)
                                 if trait_predicate
                                     .trait_ref
                                     .args
                                     .types()
                                     .skip(1) // Skip the implicit `Self` generic parameter
-                                    .any(|ty| contains_ty_adt_constructor_opaque_inner(cx, ty, needle, seen))
-                                {
-                                    return true;
-                                }
+                                    .any(|ty| contains_ty_adt_constructor_opaque_inner(cx, ty, needle, seen)) =>
+                            {
+                                return true;
                             },
                             // For `impl Trait<Assoc=U>`, it will register a predicate of `<T as Trait>::Assoc = U`,
                             // so we check the term for `U`.
@@ -308,24 +311,34 @@ pub fn has_drop<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
     }
 }
 
-// Returns whether the type has #[must_use] attribute
+// Returns whether the `ty` has `#[must_use]` attribute. If `ty` is a `Result`/`ControlFlow`
+// whose `Err`/`Break` payload is an uninhabited type, the `Ok`/`Continue` payload type
+// will be used instead. See <https://github.com/rust-lang/rust/pull/148214>.
 pub fn is_must_use_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
     match ty.kind() {
-        ty::Adt(adt, _) => find_attr!(cx.tcx.get_all_attrs(adt.did()), AttributeKind::MustUse { .. }),
-        ty::Foreign(did) => find_attr!(cx.tcx.get_all_attrs(*did), AttributeKind::MustUse { .. }),
+        ty::Adt(adt, args) => match cx.tcx.get_diagnostic_name(adt.did()) {
+            Some(sym::Result) if args.type_at(1).is_privately_uninhabited(cx.tcx, cx.typing_env()) => {
+                is_must_use_ty(cx, args.type_at(0))
+            },
+            Some(sym::ControlFlow) if args.type_at(0).is_privately_uninhabited(cx.tcx, cx.typing_env()) => {
+                is_must_use_ty(cx, args.type_at(1))
+            },
+            _ => find_attr!(cx.tcx, adt.did(), MustUse { .. }),
+        },
+        ty::Foreign(did) => find_attr!(cx.tcx, *did, MustUse { .. }),
         ty::Slice(ty) | ty::Array(ty, _) | ty::RawPtr(ty, _) | ty::Ref(_, ty, _) => {
             // for the Array case we don't need to care for the len == 0 case
             // because we don't want to lint functions returning empty arrays
             is_must_use_ty(cx, *ty)
         },
         ty::Tuple(args) => args.iter().any(|ty| is_must_use_ty(cx, ty)),
-        ty::Alias(ty::Opaque, AliasTy { def_id, .. }) => {
-            for (predicate, _) in cx.tcx.explicit_item_self_bounds(def_id).skip_binder() {
+        ty::Alias(AliasTy {
+            kind: ty::Opaque { def_id },
+            ..
+        }) => {
+            for (predicate, _) in cx.tcx.explicit_item_self_bounds(*def_id).skip_binder() {
                 if let ty::ClauseKind::Trait(trait_predicate) = predicate.kind().skip_binder()
-                    && find_attr!(
-                        cx.tcx.get_all_attrs(trait_predicate.trait_ref.def_id),
-                        AttributeKind::MustUse { .. }
-                    )
+                    && find_attr!(cx.tcx, trait_predicate.trait_ref.def_id, MustUse { .. })
                 {
                     return true;
                 }
@@ -335,7 +348,7 @@ pub fn is_must_use_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
         ty::Dynamic(binder, _) => {
             for predicate in *binder {
                 if let ty::ExistentialPredicate::Trait(ref trait_ref) = predicate.skip_binder()
-                    && find_attr!(cx.tcx.get_all_attrs(trait_ref.def_id), AttributeKind::MustUse { .. })
+                    && find_attr!(cx.tcx, trait_ref.def_id, MustUse { .. })
                 {
                     return true;
                 }
@@ -596,7 +609,7 @@ impl<'tcx> ExprFnSig<'tcx> {
 /// If the expression is function like, get the signature for it.
 pub fn expr_sig<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'_>) -> Option<ExprFnSig<'tcx>> {
     if let Res::Def(DefKind::Fn | DefKind::Ctor(_, CtorKind::Fn) | DefKind::AssocFn, id) = expr.res(cx) {
-        Some(ExprFnSig::Sig(cx.tcx.fn_sig(id).instantiate_identity(), Some(id)))
+        Some(ExprFnSig::Sig(cx.tcx.fn_sig(id).instantiate_identity().skip_norm_wip(), Some(id)))
     } else {
         ty_sig(cx, cx.typeck_results().expr_ty_adjusted(expr).peel_refs())
     }
@@ -614,11 +627,15 @@ pub fn ty_sig<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<ExprFnSig<'t
                 .and_then(|id| cx.tcx.hir_fn_decl_by_hir_id(cx.tcx.local_def_id_to_hir_id(id)));
             Some(ExprFnSig::Closure(decl, subs.as_closure().sig()))
         },
-        ty::FnDef(id, subs) => Some(ExprFnSig::Sig(cx.tcx.fn_sig(id).instantiate(cx.tcx, subs), Some(id))),
-        ty::Alias(ty::Opaque, AliasTy { def_id, args, .. }) => sig_from_bounds(
+        ty::FnDef(id, subs) => Some(ExprFnSig::Sig(cx.tcx.fn_sig(id).instantiate(cx.tcx, subs).skip_norm_wip(), Some(id))),
+        ty::Alias(AliasTy {
+            kind: ty::Opaque { def_id },
+            args,
+            ..
+        }) => sig_from_bounds(
             cx,
             ty,
-            cx.tcx.item_self_bounds(def_id).iter_instantiated(cx.tcx, args),
+            cx.tcx.item_self_bounds(def_id).iter_instantiated(cx.tcx, args).map(Unnormalized::skip_norm_wip),
             cx.tcx.opt_parent(def_id),
         ),
         ty::FnPtr(sig_tys, hdr) => Some(ExprFnSig::Sig(sig_tys.with(hdr), None)),
@@ -639,7 +656,12 @@ pub fn ty_sig<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<ExprFnSig<'t
                 _ => None,
             }
         },
-        ty::Alias(ty::Projection, proj) => match cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty) {
+        ty::Alias(
+            proj @ AliasTy {
+                kind: ty::Projection { .. },
+                ..
+            },
+        ) => match cx.tcx.try_normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(ty)) {
             Ok(normalized_ty) if normalized_ty != ty => ty_sig(cx, normalized_ty),
             _ => sig_for_projection(cx, proj).or_else(|| sig_from_bounds(cx, ty, cx.param_env.caller_bounds(), None)),
         },
@@ -674,7 +696,7 @@ fn sig_from_bounds<'tcx>(
                 inputs = Some(i);
             },
             ty::ClauseKind::Projection(p)
-                if Some(p.projection_term.def_id) == lang_items.fn_once_output()
+                if Some(p.projection_term.def_id()) == lang_items.fn_once_output()
                     && p.projection_term.self_ty() == ty =>
             {
                 if output.is_some() {
@@ -697,8 +719,9 @@ fn sig_for_projection<'tcx>(cx: &LateContext<'tcx>, ty: AliasTy<'tcx>) -> Option
 
     for (pred, _) in cx
         .tcx
-        .explicit_item_bounds(ty.def_id)
+        .explicit_item_bounds(ty.kind.def_id())
         .iter_instantiated_copied(cx.tcx, ty.args)
+        .map(Unnormalized::skip_norm_wip)
     {
         match pred.kind().skip_binder() {
             ty::ClauseKind::Trait(p)
@@ -714,7 +737,7 @@ fn sig_for_projection<'tcx>(cx: &LateContext<'tcx>, ty: AliasTy<'tcx>) -> Option
                 }
                 inputs = Some(i);
             },
-            ty::ClauseKind::Projection(p) if Some(p.projection_term.def_id) == lang_items.fn_once_output() => {
+            ty::ClauseKind::Projection(p) if Some(p.projection_term.def_id()) == lang_items.fn_once_output() => {
                 if output.is_some() {
                     // Multiple different fn trait impls. Is this even allowed?
                     return None;
@@ -746,7 +769,7 @@ impl core::ops::Add<u32> for EnumValue {
 /// Attempts to read the given constant as though it were an enum value.
 pub fn read_explicit_enum_value(tcx: TyCtxt<'_>, id: DefId) -> Option<EnumValue> {
     if let Ok(ConstValue::Scalar(Scalar::Int(value))) = tcx.const_eval_poly(id) {
-        match tcx.type_of(id).instantiate_identity().kind() {
+        match tcx.type_of(id).instantiate_identity().skip_norm_wip().kind() {
             ty::Int(_) => Some(EnumValue::Signed(value.to_int(value.size()))),
             ty::Uint(_) => Some(EnumValue::Unsigned(value.to_uint(value.size()))),
             _ => None,
@@ -868,7 +891,7 @@ pub fn adt_and_variant_of_res<'tcx>(cx: &LateContext<'tcx>, res: Res) -> Option<
             Some((adt, adt.variant_with_id(var_id)))
         },
         Res::SelfCtor(id) => {
-            let adt = cx.tcx.type_of(id).instantiate_identity().ty_adt_def().unwrap();
+            let adt = cx.tcx.type_of(id).instantiate_identity().skip_norm_wip().ty_adt_def().unwrap();
             Some((adt, adt.non_enum_variant()))
         },
         _ => None,
@@ -1005,7 +1028,11 @@ pub fn make_projection<'tcx>(
         #[cfg(debug_assertions)]
         assert_generic_args_match(tcx, assoc_item.def_id, args);
 
-        Some(AliasTy::new_from_args(tcx, assoc_item.def_id, args))
+        Some(AliasTy::new_from_args(
+            tcx,
+            ty::AliasTyKind::new_from_def_id(tcx, assoc_item.def_id),
+            args,
+        ))
     }
     helper(
         tcx,
@@ -1044,7 +1071,10 @@ pub fn make_normalized_projection<'tcx>(
             );
             return None;
         }
-        match tcx.try_normalize_erasing_regions(typing_env, Ty::new_projection_from_args(tcx, ty.def_id, ty.args)) {
+        match tcx.try_normalize_erasing_regions(
+            typing_env,
+            Unnormalized::new_wip(Ty::new_projection_from_args(tcx, ty.kind.def_id(), ty.args))
+        ) {
             Ok(ty) => Some(ty),
             Err(e) => {
                 debug_assert!(false, "failed to normalize type `{ty}`: {e:#?}");
@@ -1146,7 +1176,10 @@ impl<'tcx> InteriorMut<'tcx> {
                         .find_map(|f| self.interior_mut_ty_chain_inner(cx, f.ty(cx.tcx, args), depth))
                 }
             },
-            ty::Alias(ty::Projection, _) => match cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty) {
+            ty::Alias(AliasTy {
+                kind: ty::Projection { .. },
+                ..
+            }) => match cx.tcx.try_normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(ty)) {
                 Ok(normalized_ty) if ty != normalized_ty => self.interior_mut_ty_chain_inner(cx, normalized_ty, depth),
                 _ => None,
             },
@@ -1194,7 +1227,7 @@ pub fn make_normalized_projection_with_regions<'tcx>(
         let (infcx, param_env) = tcx.infer_ctxt().build_with_typing_env(typing_env);
         match infcx
             .at(&cause, param_env)
-            .query_normalize(Ty::new_projection_from_args(tcx, ty.def_id, ty.args))
+            .query_normalize(Ty::new_projection_from_args(tcx, ty.kind.def_id(), ty.args))
         {
             Ok(ty) => Some(ty.value),
             Err(e) => {
@@ -1238,17 +1271,14 @@ pub fn deref_chain<'cx, 'tcx>(cx: &'cx LateContext<'tcx>, ty: Ty<'tcx>) -> impl 
 /// This does not look for impls in the type's `Deref::Target` type.
 /// If you need this, you should wrap this call in `clippy_utils::ty::deref_chain().any(...)`.
 pub fn get_adt_inherent_method<'a>(cx: &'a LateContext<'_>, ty: Ty<'_>, method_name: Symbol) -> Option<&'a AssocItem> {
-    if let Some(ty_did) = ty.ty_adt_def().map(AdtDef::did) {
-        cx.tcx.inherent_impls(ty_did).iter().find_map(|&did| {
-            cx.tcx
-                .associated_items(did)
-                .filter_by_name_unhygienic(method_name)
-                .next()
-                .filter(|item| item.tag() == AssocTag::Fn)
-        })
-    } else {
-        None
-    }
+    let ty_did = ty.ty_adt_def().map(AdtDef::did)?;
+    cx.tcx.inherent_impls(ty_did).iter().find_map(|&did| {
+        cx.tcx
+            .associated_items(did)
+            .filter_by_name_unhygienic(method_name)
+            .next()
+            .filter(|item| item.tag() == AssocTag::Fn)
+    })
 }
 
 /// Gets the type of a field by name.
@@ -1263,6 +1293,13 @@ pub fn get_field_by_name<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, name: Symbol) ->
         ty::Tuple(args) => name.as_str().parse::<usize>().ok().and_then(|i| args.get(i).copied()),
         _ => None,
     }
+}
+
+pub fn get_field_def_id_by_name(ty: Ty<'_>, name: Symbol) -> Option<DefId> {
+    let ty::Adt(adt_def, ..) = ty.kind() else { return None };
+    adt_def
+        .all_fields()
+        .find_map(|field| if field.name == name { Some(field.did) } else { None })
 }
 
 /// Check if `ty` is an `Option` and return its argument type if it is.
@@ -1285,7 +1322,7 @@ pub fn option_arg_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'t
 /// skipping iterating over an iterator will change its behavior.
 pub fn has_non_owning_mutable_access<'tcx>(cx: &LateContext<'tcx>, iter_ty: Ty<'tcx>) -> bool {
     fn normalize_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
-        cx.tcx.try_normalize_erasing_regions(cx.typing_env(), ty).unwrap_or(ty)
+        cx.tcx.try_normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(ty)).unwrap_or(ty)
     }
 
     /// Check if `ty` contains mutable references or equivalent, which includes:

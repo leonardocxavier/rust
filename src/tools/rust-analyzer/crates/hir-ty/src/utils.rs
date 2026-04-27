@@ -1,28 +1,22 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
 
-use std::cell::LazyCell;
+use std::iter::Enumerate;
 
 use base_db::target::{self, TargetData};
 use hir_def::{
-    EnumId, EnumVariantId, FunctionId, Lookup, TraitId,
-    attrs::AttrFlags,
-    db::DefDatabase,
-    hir::generics::WherePredicate,
-    lang_item::LangItems,
-    resolver::{HasResolver, TypeNs},
-    type_ref::{TraitBoundModifier, TypeRef},
+    EnumId, EnumVariantId, FunctionId, Lookup, TraitId, attrs::AttrFlags, lang_item::LangItems,
+    signatures::FunctionSignature,
 };
 use intern::sym;
 use rustc_abi::TargetDataLayout;
-use smallvec::{SmallVec, smallvec};
 use span::Edition;
 
 use crate::{
     TargetFeatures,
     db::HirDatabase,
     layout::{Layout, TagEncoding},
-    lower::all_supertraits_trait_refs,
+    lower::SupertraitsInfo,
     mir::pad16,
 };
 
@@ -51,55 +45,13 @@ pub(crate) fn fn_traits(lang_items: &LangItems) -> impl Iterator<Item = TraitId>
 }
 
 /// Returns an iterator over the direct super traits (including the trait itself).
-pub fn direct_super_traits(db: &dyn DefDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
-    let mut result = smallvec![trait_];
-    direct_super_traits_cb(db, trait_, |tt| {
-        if !result.contains(&tt) {
-            result.push(tt);
-        }
-    });
-    result
+pub fn direct_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+    &SupertraitsInfo::query(db, trait_).direct_supertraits
 }
 
-/// Returns an iterator over the whole super trait hierarchy (including the
-/// trait itself).
-pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> SmallVec<[TraitId; 4]> {
-    let mut supertraits = all_supertraits_trait_refs(db, trait_)
-        .map(|trait_ref| trait_ref.skip_binder().def_id.0)
-        .collect::<SmallVec<[_; _]>>();
-    supertraits.sort_unstable();
-    supertraits.dedup();
-    supertraits
-}
-
-fn direct_super_traits_cb(db: &dyn DefDatabase, trait_: TraitId, cb: impl FnMut(TraitId)) {
-    let resolver = LazyCell::new(|| trait_.resolver(db));
-    let (generic_params, store) = db.generic_params_and_store(trait_.into());
-    let trait_self = generic_params.trait_self_param();
-    generic_params
-        .where_predicates()
-        .iter()
-        .filter_map(|pred| match pred {
-            WherePredicate::ForLifetime { target, bound, .. }
-            | WherePredicate::TypeBound { target, bound } => {
-                let is_trait = match &store[*target] {
-                    TypeRef::Path(p) => p.is_self_type(),
-                    TypeRef::TypeParam(p) => Some(p.local_id()) == trait_self,
-                    _ => false,
-                };
-                match is_trait {
-                    true => bound.as_path(&store),
-                    false => None,
-                }
-            }
-            WherePredicate::Lifetime { .. } => None,
-        })
-        .filter(|(_, bound_modifier)| matches!(bound_modifier, TraitBoundModifier::None))
-        .filter_map(|(path, _)| match resolver.resolve_path_in_type_ns_fully(db, path) {
-            Some(TypeNs::TraitId(t)) => Some(t),
-            _ => None,
-        })
-        .for_each(cb);
+/// Returns the whole super trait hierarchy (including the trait itself).
+pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+    &SupertraitsInfo::query(db, trait_).all_supertraits
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +82,7 @@ pub fn is_fn_unsafe_to_call(
     call_edition: Edition,
     target_feature_is_safe: TargetFeatureIsSafeInTarget,
 ) -> Unsafety {
-    let data = db.function_signature(func);
+    let data = FunctionSignature::of(db, func);
     if data.is_unsafe() {
         return Unsafety::Unsafe;
     }
@@ -212,4 +164,55 @@ pub(crate) fn detect_variant_from_bytes<'a>(
         }
     };
     Some((var_id, var_layout))
+}
+
+pub(crate) struct EnumerateAndAdjust<I> {
+    enumerate: Enumerate<I>,
+    gap_pos: usize,
+    gap_len: usize,
+}
+
+impl<I> Iterator for EnumerateAndAdjust<I>
+where
+    I: Iterator,
+{
+    type Item = (usize, <I as Iterator>::Item);
+
+    fn next(&mut self) -> Option<(usize, <I as Iterator>::Item)> {
+        self.enumerate
+            .next()
+            .map(|(i, elem)| (if i < self.gap_pos { i } else { i + self.gap_len }, elem))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.enumerate.size_hint()
+    }
+}
+
+pub(crate) trait EnumerateAndAdjustIterator {
+    fn enumerate_and_adjust(
+        self,
+        expected_len: usize,
+        gap_pos: Option<u32>,
+    ) -> EnumerateAndAdjust<Self>
+    where
+        Self: Sized;
+}
+
+impl<T: ExactSizeIterator> EnumerateAndAdjustIterator for T {
+    fn enumerate_and_adjust(
+        self,
+        expected_len: usize,
+        gap_pos: Option<u32>,
+    ) -> EnumerateAndAdjust<Self>
+    where
+        Self: Sized,
+    {
+        let actual_len = self.len();
+        EnumerateAndAdjust {
+            enumerate: self.enumerate(),
+            gap_pos: gap_pos.map(|it| it as usize).unwrap_or(expected_len),
+            gap_len: expected_len - actual_len,
+        }
+    }
 }

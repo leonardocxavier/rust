@@ -214,6 +214,23 @@ Whether `unwrap` should be allowed in test functions or `#[cfg(test)]`
 * [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
 
 
+## `allow-unwrap-types`
+List of types to allow `unwrap()` and `expect()` on.
+
+#### Example
+
+```toml
+allow-unwrap-types = [ "std::sync::LockResult" ]
+```
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`expect_used`](https://rust-lang.github.io/rust-clippy/master/index.html#expect_used)
+* [`unwrap_used`](https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used)
+
+
 ## `allow-useless-vec-in-tests`
 Whether `useless_vec` should ignore test functions or `#[cfg(test)]`
 
@@ -503,6 +520,23 @@ The minimum digits a const float literal must have to supress the `excessive_pre
 ---
 **Affected lints:**
 * [`excessive_precision`](https://rust-lang.github.io/rust-clippy/master/index.html#excessive_precision)
+
+
+## `disallowed-fields`
+The list of disallowed fields, written as fully qualified paths.
+
+**Fields:**
+- `path` (required): the fully qualified path to the field that should be disallowed
+- `reason` (optional): explanation why this field is disallowed
+- `replacement` (optional): suggested alternative method
+- `allow-invalid` (optional, `false` by default): when set to `true`, it will ignore this entry
+  if the path doesn't exist, instead of emitting an error
+
+**Default Value:** `[]`
+
+---
+**Affected lints:**
+* [`disallowed_fields`](https://rust-lang.github.io/rust-clippy/master/index.html#disallowed_fields)
 
 
 ## `disallowed-macros`
@@ -894,6 +928,7 @@ The minimum rust version that the project supports. Defaults to the `rust-versio
 * [`manual_let_else`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_let_else)
 * [`manual_midpoint`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_midpoint)
 * [`manual_non_exhaustive`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_non_exhaustive)
+* [`manual_noop_waker`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_noop_waker)
 * [`manual_option_as_slice`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_option_as_slice)
 * [`manual_pattern_char_comparison`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_pattern_char_comparison)
 * [`manual_range_contains`](https://rust-lang.github.io/rust-clippy/master/index.html#manual_range_contains)

@@ -21,11 +21,10 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(assert_matches))]
-#![cfg_attr(bootstrap, feature(if_let_guard))]
 #![feature(box_patterns)]
 #![feature(iter_order_by)]
 #![feature(rustc_attrs)]
+#![feature(titlecase)]
 #![feature(try_blocks)]
 // tidy-alphabetical-end
 
@@ -37,6 +36,7 @@ mod context;
 mod dangling;
 mod default_could_be_derived;
 mod deref_into_dyn_supertrait;
+mod disallowed_pass_by_ref;
 mod drop_forget_useless;
 mod early;
 mod enum_intrinsics_non_enums;
@@ -65,7 +65,6 @@ mod non_local_def;
 mod nonstandard_style;
 mod noop_method_call;
 mod opaque_hidden_inferred_bound;
-mod pass_by_value;
 mod passes;
 mod precedence;
 mod ptr_nulls;
@@ -78,7 +77,7 @@ mod transmute;
 mod types;
 mod unit_bindings;
 mod unqualified_local_imports;
-mod unused;
+pub mod unused;
 mod utils;
 
 use async_closures::AsyncClosureUsage;
@@ -88,6 +87,7 @@ use builtin::*;
 use dangling::*;
 use default_could_be_derived::DefaultCouldBeDerived;
 use deref_into_dyn_supertrait::*;
+use disallowed_pass_by_ref::*;
 use drop_forget_useless::*;
 use enum_intrinsics_non_enums::EnumIntrinsicsNonEnums;
 use for_loops_over_fallibles::*;
@@ -109,7 +109,6 @@ use non_local_def::*;
 use nonstandard_style::*;
 use noop_method_call::*;
 use opaque_hidden_inferred_bound::*;
-use pass_by_value::*;
 use precedence::*;
 use ptr_nulls::*;
 use redundant_semicolon::*;
@@ -125,12 +124,13 @@ use transmute::CheckTransmutes;
 use types::*;
 use unit_bindings::*;
 use unqualified_local_imports::*;
+use unused::must_use::*;
 use unused::*;
 
 #[rustfmt::skip]
 pub use builtin::{MissingDoc, SoftLints};
 pub use context::{CheckLintNameResult, EarlyContext, LateContext, LintContext, LintStore};
-pub use early::diagnostics::{decorate_attribute_lint, decorate_builtin_lint};
+pub use early::diagnostics::{DecorateAttrLint, DiagAndSess};
 pub use early::{EarlyCheckNode, check_ast_node};
 pub use late::{check_crate, late_lint_mod, unerased_lint_store};
 pub use levels::LintLevelsBuilder;
@@ -249,6 +249,7 @@ late_lint_methods!(
             FunctionCastsAsInteger: FunctionCastsAsInteger,
             CheckTransmutes: CheckTransmutes,
             LifetimeSyntax: LifetimeSyntax,
+            InternalEqTraitMethodImpls: InternalEqTraitMethodImpls,
         ]
     ]
 );
@@ -642,6 +643,7 @@ fn register_builtins(store: &mut LintStore) {
          see <https://github.com/rust-lang/rust/issues/40107> for more information",
     );
     store.register_removed("wasm_c_abi", "the wasm C ABI has been fixed");
+    store.register_removed("soft_unstable", "the general soft-unstable mechanism has been removed");
 }
 
 fn register_internals(store: &mut LintStore) {
@@ -657,14 +659,18 @@ fn register_internals(store: &mut LintStore) {
     store.register_late_mod_pass(|_| Box::new(TypeIr));
     store.register_lints(&BadOptAccess::lint_vec());
     store.register_late_mod_pass(|_| Box::new(BadOptAccess));
-    store.register_lints(&PassByValue::lint_vec());
-    store.register_late_mod_pass(|_| Box::new(PassByValue));
+    store.register_lints(&DisallowedPassByRef::lint_vec());
+    store.register_late_mod_pass(|_| Box::new(DisallowedPassByRef));
     store.register_lints(&SpanUseEqCtxt::lint_vec());
     store.register_late_mod_pass(|_| Box::new(SpanUseEqCtxt));
     store.register_lints(&SymbolInternStringLiteral::lint_vec());
     store.register_late_mod_pass(|_| Box::new(SymbolInternStringLiteral));
     store.register_lints(&ImplicitSysrootCrateImport::lint_vec());
     store.register_early_pass(|| Box::new(ImplicitSysrootCrateImport));
+    store.register_lints(&BadUseOfFindAttr::lint_vec());
+    store.register_early_pass(|| Box::new(BadUseOfFindAttr));
+    store.register_lints(&RustcMustMatchExhaustively::lint_vec());
+    store.register_late_pass(|_| Box::new(RustcMustMatchExhaustively));
     store.register_group(
         false,
         "rustc::internal",
@@ -674,7 +680,7 @@ fn register_internals(store: &mut LintStore) {
             LintId::of(POTENTIAL_QUERY_INSTABILITY),
             LintId::of(UNTRACKED_QUERY_INFORMATION),
             LintId::of(USAGE_OF_TY_TYKIND),
-            LintId::of(PASS_BY_VALUE),
+            LintId::of(DISALLOWED_PASS_BY_REF),
             LintId::of(LINT_PASS_IMPL_WITHOUT_MACRO),
             LintId::of(USAGE_OF_QUALIFIED_TY),
             LintId::of(NON_GLOB_IMPORT_OF_TYPE_IR_INHERENT),
@@ -684,6 +690,8 @@ fn register_internals(store: &mut LintStore) {
             LintId::of(SPAN_USE_EQ_CTXT),
             LintId::of(DIRECT_USE_OF_RUSTC_TYPE_IR),
             LintId::of(IMPLICIT_SYSROOT_CRATE_IMPORT),
+            LintId::of(BAD_USE_OF_FIND_ATTR),
+            LintId::of(RUSTC_MUST_MATCH_EXHAUSTIVELY),
         ],
     );
 }

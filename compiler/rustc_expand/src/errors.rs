@@ -3,10 +3,10 @@ use std::borrow::Cow;
 use rustc_ast::ast;
 use rustc_errors::codes::*;
 use rustc_hir::limit::Limit;
-use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
+use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Ident, MacroRulesNormalizedIdent, Span, Symbol};
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("`#[cfg_attr]` does not expand to any attributes")]
 pub(crate) struct CfgAttrNoAttributes;
 
@@ -94,7 +94,7 @@ pub(crate) struct MacroVarStillRepeating {
     pub ident: MacroRulesNormalizedIdent,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("variable `{$ident}` is still repeating at this depth")]
 pub(crate) struct MetaVarStillRepeatingLint {
     #[label("expected repetition")]
@@ -102,7 +102,7 @@ pub(crate) struct MetaVarStillRepeatingLint {
     pub ident: MacroRulesNormalizedIdent,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("meta-variable repeats with different Kleene operator")]
 pub(crate) struct MetaVariableWrongOperator {
     #[label("expected repetition")]
@@ -119,7 +119,7 @@ pub(crate) struct MetaVarsDifSeqMatchers {
     pub msg: String,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("unknown macro variable `{$name}`")]
 pub(crate) struct UnknownMacroVariable {
     pub name: MacroRulesNormalizedIdent,
@@ -181,34 +181,6 @@ pub(crate) struct RecursionLimitReached {
     pub descr: String,
     pub suggested_limit: Limit,
     pub crate_name: Symbol,
-}
-
-#[derive(Diagnostic)]
-#[diag("malformed `feature` attribute input", code = E0556)]
-pub(crate) struct MalformedFeatureAttribute {
-    #[primary_span]
-    pub span: Span,
-    #[subdiagnostic]
-    pub help: MalformedFeatureAttributeHelp,
-}
-
-#[derive(Subdiagnostic)]
-pub(crate) enum MalformedFeatureAttributeHelp {
-    #[label("expected just one word")]
-    Label {
-        #[primary_span]
-        span: Span,
-    },
-    #[suggestion(
-        "expected just one word",
-        code = "{suggestion}",
-        applicability = "maybe-incorrect"
-    )]
-    Suggestion {
-        #[primary_span]
-        span: Span,
-        suggestion: Symbol,
-    },
 }
 
 #[derive(Diagnostic)]
@@ -419,7 +391,7 @@ pub(crate) struct DuplicateMatcherBinding {
     pub prev: Span,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("duplicate matcher binding")]
 pub(crate) struct DuplicateMatcherBindingLint {
     #[label("duplicate binding")]
@@ -573,6 +545,49 @@ mod metavar_exprs {
         pub span: Span,
         pub key: MacroRulesNormalizedIdent,
     }
+
+    #[derive(Diagnostic)]
+    #[diag(r#"`${"{"}concat(..){"}"}` is not generating a valid identifier"#)]
+    pub(crate) struct ConcatInvalidIdent {
+        #[primary_span]
+        pub span: Span,
+        #[subdiagnostic]
+        pub reason: InvalidIdentReason,
+    }
+
+    #[derive(Subdiagnostic)]
+    pub(crate) enum InvalidIdentReason {
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated an empty ident"#)]
+        Empty,
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated `{$symbol}`, but {$start} is neither '_' nor XID_Start"#)]
+        #[note(
+            "see <https://doc.rust-lang.org/reference/identifiers.html> for the definition of valid identifiers"
+        )]
+        InvalidStart { symbol: Symbol, start: char },
+        #[note(r#"this `${"{"}concat(..){"}"}` invocation generated `{$symbol}`, but {$not_continue} is not XID_Continue"#)]
+        #[note(
+            "see <https://doc.rust-lang.org/reference/identifiers.html> for the definition of valid identifiers"
+        )]
+        InvalidContinue { symbol: Symbol, not_continue: char },
+    }
+
+    impl InvalidIdentReason {
+        pub(crate) fn new(symbol: Symbol) -> Self {
+            let mut chars = symbol.as_str().chars();
+            if let Some(start) = chars.next() {
+                if rustc_lexer::is_id_start(start) {
+                    let not_continue = chars
+                        .find(|c| !rustc_lexer::is_id_continue(*c))
+                        .expect("InvalidIdentReason: cannot find invalid ident reason");
+                    InvalidIdentReason::InvalidContinue { symbol, not_continue }
+                } else {
+                    InvalidIdentReason::InvalidStart { symbol, start }
+                }
+            } else {
+                InvalidIdentReason::Empty
+            }
+        }
+    }
 }
 
 #[derive(Diagnostic)]
@@ -597,7 +612,7 @@ pub(crate) struct MacroArgsBadDelimSugg {
     pub close: Span,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("unused doc comment")]
 #[help(
     "to document an item produced by a macro, the macro must produce the documentation as part of its expansion"
@@ -607,7 +622,7 @@ pub(crate) struct MacroCallUnusedDocComment {
     pub span: Span,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag(
     "the meaning of the `pat` fragment specifier is changing in Rust 2021, which may affect this macro"
 )]
@@ -621,7 +636,7 @@ pub(crate) struct OrPatternsBackCompat {
     pub suggestion: String,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("trailing semicolon in macro used in expression position")]
 pub(crate) struct TrailingMacro {
     #[note("macro invocations at the end of a block are treated as expressions")]
@@ -632,7 +647,7 @@ pub(crate) struct TrailingMacro {
     pub name: Ident,
 }
 
-#[derive(LintDiagnostic)]
+#[derive(Diagnostic)]
 #[diag("unused attribute `{$attr_name}`")]
 pub(crate) struct UnusedBuiltinAttribute {
     #[note(

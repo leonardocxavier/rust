@@ -223,7 +223,7 @@ impl<'tcx> fmt::Display for FrameInfo<'tcx> {
 }
 
 impl<'tcx> FrameInfo<'tcx> {
-    pub fn as_note(&self, tcx: TyCtxt<'tcx>) -> errors::FrameNote {
+    pub(crate) fn as_note(&self, tcx: TyCtxt<'tcx>) -> errors::FrameNote {
         let span = self.span;
         if tcx.def_key(self.instance.def_id()).disambiguated_data.data == DefPathData::Closure {
             errors::FrameNote {
@@ -321,12 +321,15 @@ impl<'tcx, Prov: Provenance, Extra> Frame<'tcx, Prov, Extra> {
     }
 
     #[must_use]
-    pub fn generate_stacktrace_from_stack(stack: &[Self]) -> Vec<FrameInfo<'tcx>> {
+    pub fn generate_stacktrace_from_stack(
+        stack: &[Self],
+        tcx: TyCtxt<'tcx>,
+    ) -> Vec<FrameInfo<'tcx>> {
         let mut frames = Vec::new();
         // This deliberately does *not* honor `requires_caller_location` since it is used for much
         // more than just panics.
         for frame in stack.iter().rev() {
-            let span = match frame.loc {
+            let mut span = match frame.loc {
                 Left(loc) => {
                     // If the stacktrace passes through MIR-inlined source scopes, add them.
                     let mir::SourceInfo { mut span, scope } = *frame.body.source_info(loc);
@@ -340,6 +343,10 @@ impl<'tcx, Prov: Provenance, Extra> Frame<'tcx, Prov, Extra> {
                 }
                 Right(span) => span,
             };
+            if span.is_dummy() {
+                // Some statements lack a proper span; point at the function instead.
+                span = tcx.def_span(frame.instance.def_id());
+            }
             frames.push(FrameInfo { span, instance: frame.instance });
         }
         trace!("generate stacktrace: {:#?}", frames);
@@ -374,7 +381,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         let locals = IndexVec::from_elem(dead_local, &body.local_decls);
         let pre_frame = Frame {
             body,
-            loc: Right(body.span), // Span used for errors caused during preamble.
+            loc: Right(self.tcx.def_span(body.source.def_id())), // Span used for errors caused during preamble.
             return_cont,
             return_place: return_place.clone(),
             locals,
@@ -401,7 +408,6 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
         // Finish things up.
         M::after_stack_push(self)?;
-        self.frame_mut().loc = Left(mir::Location::START);
         // `tracing_separate_thread` is used to instruct the tracing_chrome [tracing::Layer] in Miri
         // to put the "frame" span on a separate trace thread/line than other spans, to make the
         // visualization in <https://ui.perfetto.dev> easier to interpret. It is set to a value of
@@ -459,9 +465,11 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         }
     }
 
-    /// In the current stack frame, mark all locals as live that are not arguments and don't have
-    /// `Storage*` annotations (this includes the return place).
-    pub(crate) fn storage_live_for_always_live_locals(&mut self) -> InterpResult<'tcx> {
+    /// Call this after `push_stack_frame_raw` and when all the other setup that needs to be done
+    /// is completed.
+    pub(crate) fn push_stack_frame_done(&mut self) -> InterpResult<'tcx> {
+        // Mark all locals as live that are not arguments and don't have `Storage*` annotations
+        // (this includes the return place, but not the arguments).
         self.storage_live(mir::RETURN_PLACE)?;
 
         let body = self.body();
@@ -471,6 +479,10 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
                 self.storage_live(local)?;
             }
         }
+
+        // Get ready to execute the first instruction in the stack frame.
+        self.frame_mut().loc = Left(mir::Location::START);
+
         interp_ok(())
     }
 
@@ -624,8 +636,8 @@ impl<'a, 'tcx: 'a, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// of variadic arguments. Return a list of the places that hold those arguments.
     pub(crate) fn allocate_varargs<I, J>(
         &mut self,
-        caller_args: &mut I,
-        callee_abis: &mut J,
+        caller_args: I,
+        mut callee_abis: J,
     ) -> InterpResult<'tcx, Vec<MPlaceTy<'tcx, M::Provenance>>>
     where
         I: Iterator<Item = (&'a FnArg<'tcx, M::Provenance>, &'a ArgAbi<'tcx, Ty<'tcx>>)>,

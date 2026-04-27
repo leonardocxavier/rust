@@ -185,6 +185,7 @@ impl<'a, 'tcx> SigDropChecker<'a, 'tcx> {
         if let Some(adt) = ty.ty_adt_def()
             && get_builtin_attr(
                 self.cx.sess(),
+                #[allow(deprecated)]
                 self.cx.tcx.get_all_attrs(adt.did()),
                 sym::has_significant_drop,
             )
@@ -343,7 +344,7 @@ impl<'a, 'tcx> SigDropHelper<'a, 'tcx> {
         };
 
         let fn_sig = if let Some(def_id) = self.cx.typeck_results().type_dependent_def_id(parent_expr.hir_id) {
-            self.cx.tcx.fn_sig(def_id).instantiate_identity()
+            self.cx.tcx.fn_sig(def_id).instantiate_identity().skip_norm_wip()
         } else {
             return;
         };
